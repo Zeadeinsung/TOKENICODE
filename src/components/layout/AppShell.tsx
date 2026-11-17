@@ -1,6 +1,8 @@
 import { useCallback, useRef, useEffect, useState } from 'react';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { useFileStore } from '../../stores/fileStore';
+import { useFloatBridge, useFloatVisibility } from '../../hooks/useFloatBridge';
+import { useRemotePermissionSync } from '../../hooks/useRemotePermissionSync';
 import { FilePreview } from '../files/FilePreview';
 
 interface AppShellProps {
@@ -23,6 +25,13 @@ const MIN_PREVIEW_WIDTH = 300;
 const MAX_PREVIEW_WIDTH = 1200;
 
 export function AppShell({ sidebar, main, secondary }: AppShellProps) {
+  // Feed the floating tasks strip and keep its visibility in step with the
+  // persisted toggle. Mounted here because AppShell exists exactly once.
+  useFloatBridge();
+  useFloatVisibility();
+  // Keep cards answered from the phone in step with the desktop's copies.
+  useRemotePermissionSync();
+
   const sidebarOpen = useSettingsStore((s) => s.sidebarOpen);
   const sidebarWidth = useSettingsStore((s) => s.sidebarWidth);
   const toggleSidebar = useSettingsStore((s) => s.toggleSidebar);

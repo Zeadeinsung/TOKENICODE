@@ -1,0 +1,15 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">TOKENICODE</string>
+    <string name="title_activity_main">TOKENICODE</string>
+    <string name="package_name">com.tinyzhuang.tokenicode.remote</string>
+    <string name="custom_url_scheme">com.tinyzhuang.tokenicode.remote</string>
+
+    <!-- Keep-alive service notifications -->
+    <string name="keepalive_channel">后台连接</string>
+    <string name="keepalive_channel_desc">保持与电脑端的连接，以便随时收到任务提醒</string>
+    <string name="keepalive_running">正在接收任务提醒</string>
+    <string name="tasks_channel">任务提醒</string>
+    <string name="tasks_channel_desc">有需要你处理的问题时提醒</string>
+    <string name="notif_needs_input">需要你处理</string>
+</resources>

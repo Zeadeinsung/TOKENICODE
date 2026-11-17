@@ -1,6 +1,6 @@
 [package]
 name = "tokenicode"
-version = "0.11.0"
+version = "0.12.1"
 description = "TOKENICODE - A beautiful GUI for Claude Code"
 authors = ["TinyZ"]
 license = "Apache-2.0"
@@ -29,6 +29,7 @@ serde_yaml = "0.9"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 reqwest = { version = "0.12", features = ["stream", "json", "multipart"] }
+axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
 rand = "0.8"
 trash = "5"
@@ -38,8 +39,15 @@ zip = "2"
 sha2 = "0.10"
 tauri-plugin-mcp = { git = "https://github.com/P3GLEG/tauri-plugin-mcp" }
 
+[features]
+# Production build: embed the frontend dist instead of loading the dev server at localhost:1420.
+custom-protocol = ["tauri/custom-protocol"]
+
 [dev-dependencies]
 tempfile = "3"
+
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+window-vibrancy = "0.6"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -141,4 +141,18 @@ export const PROVIDER_PRESETS: PresetProvider[] = [
       haiku: 'mimo-v2-pro',
     },
   },
+  {
+    id: 'deepseek',
+    name: 'DeepSeek',
+    baseUrl: 'https://api.deepseek.com/anthropic',
+    apiFormat: 'anthropic',
+    extra_env: {},
+    keyUrl: 'https://platform.deepseek.com/api_keys',
+    thinkingSupport: 'full',
+    defaultModels: {
+      opus: 'deepseek-v4-pro',
+      sonnet: 'deepseek-v4-flash',
+      haiku: 'deepseek-v4-flash',
+    },
+  },
 ];

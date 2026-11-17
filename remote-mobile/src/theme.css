@@ -1,0 +1,332 @@
+/* ================================================================
+   Design tokens — ported value-for-value from the desktop app
+   (TOKENICODE src/App.css, Tailwind v4 `@theme` block + theme layers).
+
+   Variable names are kept identical to the desktop's so the two can be
+   diffed against each other. Applied to <html> as:
+     .dark          → dark mode
+     .theme-blue    → accent theme (black is the default, adds no class)
+     .theme-purple
+     .theme-green
+   ================================================================ */
+
+/* --- Black (default) — light -------------------------------------- */
+:root {
+  --color-bg-primary: #f8f8fa;
+  --color-bg-secondary: #f0f0f2;
+  --color-bg-tertiary: #e8e8ea;
+  --color-bg-chat: #ffffff;
+  --color-bg-sidebar: #f5f5f7;
+  --color-bg-input: #ffffff;
+  --color-bg-user-msg: #333333;
+  --color-bg-assistant-msg: #f8f8fa;
+  --color-bg-tool: #f3f3f5;
+  --color-bg-thinking: #f0f0f2;
+  --color-bg-card: #ffffff;
+  --color-bg-nav-active: rgba(0, 0, 0, 0.04);
+
+  --color-text-primary: #1a1a1a;
+  --color-text-secondary: #555555;
+  --color-text-tertiary: #888888;
+  --color-text-inverse: #ffffff;
+  --color-text-muted: #777777;
+
+  --color-border: #e5e5ea;
+  --color-border-subtle: #ebebf0;
+  --color-border-focus: #333333;
+
+  --color-accent: #333333;
+  --color-accent-light: #555555;
+  --color-accent-hover: #1a1a1a;
+  --color-accent-glow: rgba(0, 0, 0, 0.06);
+  --color-success: #10b981;
+  --color-error: #ef4444;
+  --color-warning: #f59e0b;
+
+  --color-gradient-start: #333333;
+  --color-gradient-mid: #444444;
+  --color-gradient-end: #555555;
+
+  --color-icon-slash: white;
+
+  /* Syntax highlighting — decoupled from semantic colors */
+  --color-syntax-keyword: #7c3aed;
+  --color-syntax-string: #059669;
+  --color-syntax-number: #d97706;
+  --color-syntax-function: #2563eb;
+  --color-syntax-comment: #9ca3af;
+  --color-syntax-type: #0891b2;
+  --color-syntax-builtin: #6366f1;
+  --color-syntax-delete: #dc2626;
+  --color-syntax-meta: #78716c;
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.02);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.06), 0 2px 4px rgba(0, 0, 0, 0.03);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.08), 0 4px 8px rgba(0, 0, 0, 0.04);
+  --shadow-glow: 0 0 20px rgba(0, 0, 0, 0.06);
+
+  /* Radii mirror Tailwind's scale, which is what the desktop app is built on
+     (rounded-lg 0.5rem, rounded-xl 0.75rem, rounded-2xl 1rem, rounded-[10px]). */
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
+  --radius-2xl: 1rem;
+  --radius-squircle: 0.625rem;
+
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+}
+
+/* --- Black — dark -------------------------------------------------- */
+.dark {
+  --color-bg-primary: #141414;
+  --color-bg-secondary: #1c1c1e;
+  --color-bg-tertiary: #2c2c2e;
+  --color-bg-chat: #0a0a0a;
+  --color-bg-sidebar: #1c1c1e;
+  --color-bg-input: #1c1c1e;
+  --color-bg-user-msg: #d0d0d0;
+  --color-bg-assistant-msg: #1a1a1c;
+  --color-bg-tool: #1e1e20;
+  --color-bg-thinking: #1a1a1c;
+  --color-bg-card: #262628;
+
+  --color-text-primary: #f0f0f0;
+  --color-text-secondary: #b0b0b0;
+  --color-text-tertiary: #8c8c8c;
+  --color-text-inverse: #101010;
+  --color-text-muted: #a3a3a3;
+
+  --color-border: #38383a;
+  --color-border-subtle: #2c2c2e;
+  --color-border-focus: #d0d0d0;
+
+  --color-accent: #d0d0d0;
+  --color-accent-light: #e0e0e0;
+  --color-accent-hover: #ffffff;
+  --color-accent-glow: rgba(255, 255, 255, 0.08);
+
+  --color-gradient-start: #d0d0d0;
+  --color-gradient-mid: #e0e0e0;
+  --color-gradient-end: #f0f0f0;
+
+  --color-icon-slash: black;
+
+  --color-syntax-keyword: #a78bfa;
+  --color-syntax-string: #34d399;
+  --color-syntax-number: #fbbf24;
+  --color-syntax-function: #60a5fa;
+  --color-syntax-comment: #6b7280;
+  --color-syntax-type: #22d3ee;
+  --color-syntax-builtin: #818cf8;
+  --color-syntax-delete: #f87171;
+  --color-syntax-meta: #a8a29e;
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.2);
+  --shadow-md: 0 4px 12px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 8px 24px rgba(0, 0, 0, 0.4);
+  --shadow-glow: 0 0 20px rgba(255, 255, 255, 0.06);
+}
+
+/* --- Blue ---------------------------------------------------------- */
+.theme-blue {
+  --color-bg-user-msg: #4e80f7;
+  --color-bg-nav-active: rgba(78, 128, 247, 0.06);
+
+  --color-text-secondary: #4e80f7;
+  --color-border-focus: #4e80f7;
+
+  --color-accent: #4e80f7;
+  --color-accent-light: #6b9aff;
+  --color-accent-hover: #3d6fe6;
+  --color-accent-glow: rgba(78, 128, 247, 0.1);
+
+  --color-gradient-start: #4e80f7;
+  --color-gradient-mid: #5c8eff;
+  --color-gradient-end: #6b9aff;
+
+  /* Swap function hue to avoid blue-on-blue */
+  --color-syntax-keyword: #9333ea;
+  --color-syntax-function: #0891b2;
+
+  --shadow-glow: 0 0 20px rgba(78, 128, 247, 0.1);
+  --color-icon-slash: var(--color-accent);
+}
+
+.theme-blue.dark,
+.dark.theme-blue {
+  --color-bg-user-msg: #6b9aff;
+
+  --color-text-secondary: #6b9aff;
+  --color-border-focus: #6b9aff;
+
+  --color-accent: #6b9aff;
+  --color-accent-light: #8ab2ff;
+  --color-accent-hover: #4e80f7;
+  --color-accent-glow: rgba(107, 154, 255, 0.15);
+
+  --color-gradient-start: #4e80f7;
+  --color-gradient-mid: #5c8eff;
+  --color-gradient-end: #6b9aff;
+
+  --color-syntax-keyword: #c084fc;
+  --color-syntax-function: #22d3ee;
+
+  --shadow-glow: 0 0 20px rgba(107, 154, 255, 0.1);
+  --color-icon-slash: var(--color-accent);
+}
+
+/* --- Purple -------------------------------------------------------- */
+.theme-purple {
+  --color-bg-user-msg: #9169bf;
+  --color-bg-nav-active: rgba(145, 105, 191, 0.06);
+
+  --color-text-secondary: #9169bf;
+  --color-border-focus: #9169bf;
+
+  --color-accent: #9169bf;
+  --color-accent-light: #a684cc;
+  --color-accent-hover: #7a5aa3;
+  --color-accent-glow: rgba(145, 105, 191, 0.1);
+
+  --color-gradient-start: #9169bf;
+  --color-gradient-mid: #9b77c6;
+  --color-gradient-end: #a684cc;
+
+  --color-syntax-keyword: #2563eb;
+  --color-syntax-function: #0891b2;
+
+  --shadow-glow: 0 0 20px rgba(145, 105, 191, 0.1);
+  --color-icon-slash: var(--color-accent);
+}
+
+.theme-purple.dark,
+.dark.theme-purple {
+  --color-bg-user-msg: #a684cc;
+
+  --color-text-secondary: #a684cc;
+  --color-border-focus: #a684cc;
+
+  --color-accent: #a684cc;
+  --color-accent-light: #c0a0dc;
+  --color-accent-hover: #9169bf;
+  --color-accent-glow: rgba(166, 132, 204, 0.15);
+
+  --color-gradient-start: #9169bf;
+  --color-gradient-mid: #9b77c6;
+  --color-gradient-end: #a684cc;
+
+  --color-syntax-keyword: #60a5fa;
+  --color-syntax-function: #22d3ee;
+
+  --shadow-glow: 0 0 20px rgba(166, 132, 204, 0.1);
+  --color-icon-slash: var(--color-accent);
+}
+
+/* --- Green --------------------------------------------------------- */
+.theme-green {
+  --color-bg-user-msg: #57a64b;
+  --color-bg-nav-active: rgba(87, 166, 75, 0.06);
+
+  --color-text-secondary: #4ca85a;
+  --color-border-focus: #57a64b;
+
+  --color-accent: #57a64b;
+  --color-accent-light: #6dbf62;
+  --color-accent-hover: #56ad63;
+  --color-accent-glow: rgba(87, 166, 75, 0.1);
+  --color-success: #57a64b;
+
+  --color-gradient-start: #57a64b;
+  --color-gradient-mid: #73c880;
+  --color-gradient-end: #6dbf62;
+
+  --color-syntax-string: #d97706;
+  --color-syntax-function: #0891b2;
+
+  --shadow-glow: 0 0 20px rgba(87, 166, 75, 0.1);
+  --color-icon-slash: var(--color-accent);
+}
+
+.theme-green.dark,
+.dark.theme-green {
+  --color-bg-user-msg: #6dbf62;
+
+  --color-text-secondary: #6dbf62;
+  --color-border-focus: #6dbf62;
+
+  --color-accent: #6dbf62;
+  --color-accent-light: #97dea2;
+  --color-accent-hover: #57a64b;
+  --color-accent-glow: rgba(109, 191, 98, 0.15);
+
+  --color-gradient-start: #57a64b;
+  --color-gradient-mid: #73c880;
+  --color-gradient-end: #6dbf62;
+
+  --color-syntax-string: #fbbf24;
+  --color-syntax-function: #22d3ee;
+
+  --shadow-glow: 0 0 20px rgba(109, 191, 98, 0.1);
+  --color-icon-slash: var(--color-accent);
+}
+
+/* ================================================================
+   highlight.js — theme-aware syntax highlighting, driven by the
+   --color-syntax-* tokens above. Replaces the third-party
+   github-dark.css this app used to import.
+   ================================================================ */
+.hljs {
+  background: transparent !important;
+  color: var(--color-text-primary) !important;
+}
+.hljs-comment,
+.hljs-quote {
+  color: var(--color-syntax-comment);
+  font-style: italic;
+}
+.hljs-keyword,
+.hljs-selector-tag {
+  color: var(--color-syntax-keyword);
+  font-weight: 600;
+}
+.hljs-type {
+  color: var(--color-syntax-type);
+  font-weight: 600;
+}
+.hljs-string,
+.hljs-attr,
+.hljs-addition {
+  color: var(--color-syntax-string);
+}
+.hljs-number,
+.hljs-literal,
+.hljs-variable,
+.hljs-template-variable {
+  color: var(--color-syntax-number);
+}
+.hljs-title,
+.hljs-section,
+.hljs-name {
+  color: var(--color-syntax-function);
+}
+.hljs-built_in,
+.hljs-builtin-name {
+  color: var(--color-syntax-builtin);
+}
+.hljs-function > .hljs-title {
+  color: var(--color-syntax-function);
+}
+.hljs-deletion {
+  color: var(--color-syntax-delete);
+}
+.hljs-meta {
+  color: var(--color-syntax-meta);
+}
+.hljs-emphasis {
+  font-style: italic;
+}
+.hljs-strong {
+  font-weight: 700;
+}

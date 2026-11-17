@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover"
+    />
+    <meta name="theme-color" content="#ffffff" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <title>TOKENICODE Remote</title>
+    <script>
+      // Apply the saved appearance before React mounts so the first paint is
+      // already in the right theme (no white flash on a dark phone).
+      (function () {
+        try {
+          var a = JSON.parse(localStorage.getItem("tokenicode.mobile.theme") || "{}");
+          var modes = ["light", "dark", "system"];
+          var themes = ["black", "blue", "purple", "green"];
+          var mode = modes.indexOf(a.theme) >= 0 ? a.theme : "system";
+          var color = themes.indexOf(a.colorTheme) >= 0 ? a.colorTheme : "black";
+          var size = typeof a.fontSize === "number" ? a.fontSize : 17;
+          var dark =
+            mode === "dark" ||
+            (mode === "system" &&
+              typeof window.matchMedia === "function" &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          var root = document.documentElement;
+          root.classList.toggle("dark", dark);
+          if (color !== "black") root.classList.add("theme-" + color);
+          root.style.fontSize = Math.max(14, Math.min(22, size)) + "px";
+          var meta = document.querySelector('meta[name="theme-color"]');
+          if (meta) meta.setAttribute("content", dark ? "#0a0a0a" : "#ffffff");
+        } catch (e) {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

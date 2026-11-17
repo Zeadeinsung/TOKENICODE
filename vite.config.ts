@@ -24,6 +24,18 @@ export default defineConfig(async () => ({
     setupFiles: ['src/__tests__/setup.ts'],
   },
 
+  build: {
+    rollupOptions: {
+      // Two webviews: the app, and the transparent "running tasks" strip that
+      // the Rust side opens as a second window. Listing `input` replaces
+      // Vite's automatic `index.html` discovery, so both must be named.
+      input: {
+        main: "index.html",
+        float: "floating.html",
+      },
+    },
+  },
+
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`
   //
   // 1. prevent Vite from obscuring rust errors

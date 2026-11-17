@@ -3,6 +3,15 @@ import { useSessionStore } from './sessionStore';
 import type { ApiRetryStatus } from '../lib/api-retry';
 import type { FileAttachment } from '../hooks/useFileAttachments';
 
+// --- Tab-lifetime cleanup ---
+// Stream-processor internals (e.g. the plan-write content cache) keep
+// tab-scoped state that must be freed when the tab is removed. Registered by
+// useStreamProcessor at module init to avoid a circular import.
+let _onTabRemoved: ((tabId: string) => void) | null = null;
+export function setTabRemovedCallback(cb: (tabId: string) => void) {
+  _onTabRemoved = cb;
+}
+
 // --- Types ---
 
 export interface QuestionOption {
@@ -176,6 +185,14 @@ export interface SessionMeta {
    *  Claude CLI resume does not always include interrupted assistant output,
    *  so the next user turn may need this text injected once for continuity. */
   interruptedAssistantText?: string;
+  /** Latest `/context` breakdown for this session (context_usage payload). */
+  contextUsage?: import('../lib/context-usage').ContextUsageDetail;
+  /** Tokens occupying the context window on the latest model call
+   *  (input + cache read + cache creation). Falls back to inputTokens when absent. */
+  contextTokens?: number;
+  /** Real context window learned from the CLI (`result.modelUsage[].contextWindow`),
+   *  so proxied models are not measured against a guessed 200K. */
+  contextWindow?: number;
   /** Rate limit info from CLI rate_limit_event (latest per rateLimitType) */
   rateLimits?: Record<string, {
     rateLimitType: string;
@@ -213,6 +230,9 @@ export type ActivityPhase = 'idle' | 'thinking' | 'writing' | 'tool' | 'awaiting
 export interface ActivityStatus {
   phase: ActivityPhase;
   toolName?: string;  // only when phase === 'tool'
+  /** Concrete target of the current tool (command, file, pattern) so the UI can
+   *  say what is happening instead of only naming the tool. */
+  detail?: string;
 }
 
 // --- Per-session snapshot (backward compat type — kept for external consumers) ---
@@ -786,6 +806,7 @@ export const useChatStore = create<ChatState>()((set, get) => ({
     const newTabs = new Map(get().tabs);
     newTabs.delete(tabId);
     set({ tabs: newTabs, sessionCache: newTabs });
+    _onTabRemoved?.(tabId);
   },
 
   getTab: (tabId) => get().tabs.get(tabId),

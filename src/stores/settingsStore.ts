@@ -6,7 +6,7 @@ import { settingsEvents } from '../lib/settingsEvents';
 
 export type Theme = 'light' | 'dark' | 'system';
 export type ColorTheme = 'black' | 'blue' | 'purple' | 'green';
-export type SecondaryPanelTab = 'files' | 'skills';
+export type SecondaryPanelTab = 'files' | 'skills' | 'preview' | 'plugins';
 export type ModelId =
   | 'claude-fable-5'
   | 'claude-fable-5-1m'
@@ -68,6 +68,8 @@ interface SettingsState {
   sidebarWidth: number;
   /** Whether the CLI setup wizard has been completed or skipped */
   setupCompleted: boolean;
+  /** Whether the always-on-top floating "running tasks" strip is shown */
+  floatStripEnabled: boolean;
   /** Thinking effort level: off disables, low/medium/high/max set effort */
   thinkingLevel: ThinkingLevel;
   /** Whether a newer version is available (set by auto-check on startup) */
@@ -90,6 +92,9 @@ interface SettingsState {
   userDisplayName: string;
   /** Whether to show dotfiles (hidden files) in the file tree */
   showHiddenFiles: boolean;
+  /** Context window configured for the CLI via CLAUDE_CODE_MAX_CONTEXT_TOKENS
+   *  (0 = unknown). Used as the Ctx bar denominator for proxied models. */
+  claudeMaxContextTokens: number;
 
   toggleTheme: () => void;
   setTheme: (theme: Theme) => void;
@@ -113,6 +118,7 @@ interface SettingsState {
   decreaseFontSize: () => void;
   setSidebarWidth: (width: number) => void;
   setSetupCompleted: (completed: boolean) => void;
+  setFloatStripEnabled: (enabled: boolean) => void;
   setThinkingLevel: (level: ThinkingLevel) => void;
   setUpdateAvailable: (available: boolean, version?: string) => void;
   setUpdateDownloaded: (downloaded: boolean) => void;
@@ -121,6 +127,7 @@ interface SettingsState {
   setUserAvatarUrl: (url: string) => void;
   setUserDisplayName: (name: string) => void;
   toggleHiddenFiles: () => void;
+  setClaudeMaxContextTokens: (tokens: number) => void;
 }
 
 // --- Theme cycle order ---
@@ -152,6 +159,7 @@ export const useSettingsStore = create<SettingsState>()(
       fontSize: 18,
       sidebarWidth: 280,
       setupCompleted: false,
+      floatStripEnabled: true,
       thinkingLevel: 'medium' as ThinkingLevel,
       updateAvailable: false,
       updateVersion: '',
@@ -163,6 +171,10 @@ export const useSettingsStore = create<SettingsState>()(
       userAvatarUrl: '',
       userDisplayName: '',
       showHiddenFiles: false,
+      claudeMaxContextTokens: 0,
+
+      setClaudeMaxContextTokens: (tokens) =>
+        set(() => ({ claudeMaxContextTokens: tokens })),
 
       toggleTheme: () =>
         set((state) => ({ theme: nextTheme(state.theme) })),
@@ -233,6 +245,9 @@ export const useSettingsStore = create<SettingsState>()(
 
       setSetupCompleted: (completed) =>
         set(() => ({ setupCompleted: completed })),
+
+      setFloatStripEnabled: (enabled) =>
+        set(() => ({ floatStripEnabled: enabled })),
 
       setThinkingLevel: (level) => {
         const old = get().thinkingLevel;
@@ -340,6 +355,7 @@ export const useSettingsStore = create<SettingsState>()(
         fontSize: state.fontSize,
         sidebarWidth: state.sidebarWidth,
         setupCompleted: state.setupCompleted,
+        floatStripEnabled: state.floatStripEnabled,
         thinkingLevel: state.thinkingLevel,
         updateAvailable: state.updateAvailable,
         updateVersion: state.updateVersion,

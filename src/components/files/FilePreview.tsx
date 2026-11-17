@@ -25,9 +25,11 @@ import { toml } from '@codemirror/legacy-modes/mode/toml';
 import { dockerFile } from '@codemirror/legacy-modes/mode/dockerfile';
 import { useFileStore } from '../../stores/fileStore';
 import { bridge } from '../../lib/tauri-bridge';
+import { pushIdeState } from '../../lib/ideBridge';
 import { MarkdownRenderer } from '../shared/MarkdownRenderer';
 import { FileIcon } from '../shared/FileIcon';
 import { tokenicodeTheme, tokenicodeHighlight } from '../../lib/codemirror-theme';
+import { revealLineField, revealLineInView, setRevealLine } from '../../lib/revealLineExtension';
 import { useT } from '../../lib/i18n';
 
 /* ================================================================
@@ -117,7 +119,9 @@ export function FilePreview() {
   const discardEdits = useFileStore((s) => s.discardEdits);
   const isSaving = useFileStore((s) => s.isSaving);
   const changedFiles = useFileStore((s) => s.changedFiles);
+  const revealLine = useFileStore((s) => s.revealLine);
   const reloadContent = useFileStore((s) => s.reloadContent);
+  const editorViewRef = useRef<EditorView | null>(null);
   const showUnsavedDialog = useFileStore((s) => s.showUnsavedDialog);
   const confirmDiscard = useFileStore((s) => s.confirmDiscard);
   const confirmSaveAndSwitch = useFileStore((s) => s.confirmSaveAndSwitch);
@@ -155,6 +159,45 @@ export function FilePreview() {
   }, [fileContent, editContent, isEditing]);
 
   const langExtension = useMemo(() => getLanguageExtension(ext), [ext]);
+
+  /* Mirror the CodeMirror selection into the IDE bridge so the CLI can read it. */
+  const pushSelection = useCallback((view: EditorView) => {
+    const range = view.state.selection.main;
+    if (range.empty) {
+      pushIdeState(null);
+      return;
+    }
+    const startLine = view.state.doc.lineAt(range.from);
+    const endLine = view.state.doc.lineAt(range.to);
+    pushIdeState({
+      text: view.state.sliceDoc(range.from, range.to),
+      lineStart: startLine.number - 1,
+      lineCount: endLine.number - startLine.number + 1,
+      selection: {
+        start: { line: startLine.number - 1, character: range.from - startLine.from },
+        end: { line: endLine.number - 1, character: range.to - endLine.from },
+      },
+    });
+  }, []);
+
+  /* 聊天里点「路径:行号」→ 预览滚动到该行并高亮。等一帧让 CodeMirror
+     把异步读到的内容装进去，再按最终文档行数定位。 */
+  useEffect(() => {
+    const raf = requestAnimationFrame(() => {
+      const view = editorViewRef.current;
+      if (!view) return;
+      try {
+        if (revealLine == null) {
+          view.dispatch({ effects: setRevealLine.of(null) });
+          return;
+        }
+        revealLineInView(view, revealLine);
+      } catch {
+        // 模式切换瞬间旧 view 可能已销毁，忽略
+      }
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [revealLine, selectedFile, fileContent, previewMode]);
 
   /* Cmd+S to save */
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
@@ -368,9 +411,13 @@ export function FilePreview() {
           /* Edit mode: CodeMirror 6 editor */
           <CodeMirror
             value={editContent ?? fileContent ?? ''}
-            extensions={[...(Array.isArray(langExtension) ? langExtension : [langExtension]), EditorView.lineWrapping, tokenicodeHighlight]}
+            extensions={[...(Array.isArray(langExtension) ? langExtension : [langExtension]), EditorView.lineWrapping, tokenicodeHighlight, revealLineField]}
             theme={tokenicodeTheme}
+            onCreateEditor={(view) => { editorViewRef.current = view; }}
             onChange={(value) => setEditContent(value)}
+            onUpdate={(vu) => {
+              if (vu.selectionSet || vu.docChanged) pushSelection(vu.view);
+            }}
             height="100%"
             style={{ height: '100%', fontSize: '13px' }}
             basicSetup={{
@@ -442,10 +489,14 @@ export function FilePreview() {
           /* Source view: read-only CodeMirror */
           <CodeMirror
             value={fileContent}
-            extensions={[...(Array.isArray(langExtension) ? langExtension : [langExtension]), EditorView.lineWrapping, tokenicodeHighlight]}
+            extensions={[...(Array.isArray(langExtension) ? langExtension : [langExtension]), EditorView.lineWrapping, tokenicodeHighlight, revealLineField]}
             theme={tokenicodeTheme}
+            onCreateEditor={(view) => { editorViewRef.current = view; }}
             editable={false}
             readOnly={true}
+            onUpdate={(vu) => {
+              if (vu.selectionSet) pushSelection(vu.view);
+            }}
             height="100%"
             style={{ height: '100%', fontSize: '13px' }}
             basicSetup={{

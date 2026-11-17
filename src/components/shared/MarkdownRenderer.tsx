@@ -7,7 +7,7 @@ import { openUrl } from '@tauri-apps/plugin-opener';
 import { useLightboxStore } from './ImageLightbox';
 import { useSettingsStore } from '../../stores/settingsStore';
 import { useFileStore } from '../../stores/fileStore';
-import { classifyPathToken, resolvePathToken, KNOWN_FILE_EXTENSIONS } from '../../stores/fileReveal';
+import { classifyPathToken, resolvePathToken, splitPathAndLine, KNOWN_FILE_EXTENSIONS } from '../../stores/fileReveal';
 import { bridge } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
 
@@ -257,6 +257,14 @@ interface Props {
   className?: string;
   /** Base path for resolving relative image paths (defaults to workingDirectory) */
   basePath?: string;
+  /**
+   * Streaming mode: skip the bare-file-path regex pass. During streaming this
+   * component re-parses the whole accumulated reply several times per second,
+   * and the path-wrapping regex is an O(n) scan over text that is still moving.
+   * The finalized message renders again with streaming=false, so links appear
+   * as soon as the turn completes.
+   */
+  streaming?: boolean;
 }
 
 // Sanitize schema: GitHub defaults + className on all elements (needed for highlight.js)
@@ -358,7 +366,7 @@ class MarkdownErrorBoundary extends React.Component<
   }
 }
 
-export const MarkdownRenderer = memo(function MarkdownRenderer({ content, className, basePath }: Props) {
+export const MarkdownRenderer = memo(function MarkdownRenderer({ content, className, basePath, streaming = false }: Props) {
   const t = useT();
   const workingDirectory = useSettingsStore((s) => s.workingDirectory);
   const resolveBase = basePath || workingDirectory || '';
@@ -377,8 +385,12 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, classN
     };
   }, []);
 
-  // Pre-process: wrap bare file paths in backticks so `code` handler makes them clickable
-  const processedContent = useMemo(() => wrapBareFilePaths(content), [content]);
+  // Pre-process: wrap bare file paths in backticks so `code` handler makes them clickable.
+  // Skipped while streaming — the finalized render will add them.
+  const processedContent = useMemo(
+    () => (streaming ? content : wrapBareFilePaths(content)),
+    [content, streaming],
+  );
 
   // Stable components object — only recreated if `t` or resolveBase changes
   const components = useMemo(() => ({
@@ -513,15 +525,20 @@ export const MarkdownRenderer = memo(function MarkdownRenderer({ content, classN
       if (className) return <code className={className}>{children}</code>;
 
       const text = extractText(children).trim();
-      const kind = classifyPathToken(text);
+      const { path: pathText, line } = splitPathAndLine(text);
+      const kind = classifyPathToken(pathText);
       if (kind) {
-        const resolved = resolvePathToken(text, resolveBase);
+        const resolved = resolvePathToken(pathText, resolveBase);
         return (
           <button
             onClick={() => {
-              // 纯定位：右侧文件区展开到该路径并高亮（不读内容、不预览）
               useSettingsStore.getState().setSecondaryTab('files');
-              useFileStore.getState().revealPath(resolved);
+              if (kind === 'folder') {
+                useFileStore.getState().revealPath(resolved);
+                return;
+              }
+              // 文件：只在右侧文件树里展开定位高亮，预览等用户点右侧栏那一行
+              useFileStore.getState().revealOrOpen(resolved, line);
             }}
             className="inline-flex items-center gap-1 px-2 py-0.5 mx-0.5
               bg-bg-secondary border border-accent/50 rounded-full

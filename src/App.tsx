@@ -4,6 +4,7 @@ import { Sidebar } from './components/layout/Sidebar';
 import { ChatPanel } from './components/chat/ChatPanel';
 import { SecondaryPanel } from './components/layout/SecondaryPanel';
 import { CommandPalette } from './components/commands/CommandPalette';
+import { GlobalSearchPanel } from './components/search/GlobalSearchPanel';
 import { SettingsPanel } from './components/settings/SettingsPanel';
 import { ImageLightbox } from './components/shared/ImageLightbox';
 import { ChangelogModal } from './components/shared/ChangelogModal';
@@ -17,6 +18,9 @@ import { useSessionStore } from './stores/sessionStore';
 import { APP_NAME, IS_ALPHA } from './lib/edition';
 import { useAgentStore } from './stores/agentStore';
 import { bridge, onFileChange } from './lib/tauri-bridge';
+import { initIdeBridge } from './lib/ideBridge';
+import { setHomeDir } from './stores/fileReveal';
+import { listen } from '@tauri-apps/api/event';
 import { parseSessionMessages } from './lib/session-loader';
 import { hasRecoverableFrontendSession } from './lib/sessionLifecycle';
 import { useAutoUpdateCheck } from './hooks/useAutoUpdateCheck';
@@ -104,6 +108,43 @@ function App() {
 
   // Auto-check for app updates on startup
   useAutoUpdateCheck();
+
+  // Cache the home directory once so `~/xxx` paths in chat can be resolved.
+  useEffect(() => {
+    bridge.getHomeDir().then(setHomeDir).catch(() => {});
+  }, []);
+
+  // Read ~/.claude/settings.json env once so the Ctx bar can measure against
+  // CLAUDE_CODE_MAX_CONTEXT_TOKENS instead of guessing 200K for proxied models.
+  useEffect(() => {
+    bridge.readClaudeEnv().then((env) => {
+      const raw = Number(env?.CLAUDE_CODE_MAX_CONTEXT_TOKENS);
+      if (Number.isFinite(raw) && raw > 0) {
+        useSettingsStore.getState().setClaudeMaxContextTokens(raw);
+      }
+    }).catch(() => {});
+  }, []);
+
+  // Mirror the editor into tokenicode's IDE bridge and handle CLI requests
+  // that need UI action (open a file, save a document).
+  useEffect(() => {
+    const unsubscribe = initIdeBridge();
+    const pending = [
+      listen<{ filePath?: string }>('ide-open-file', (event) => {
+        const path = event.payload?.filePath;
+        if (path) void useFileStore.getState().selectFile(path);
+      }),
+      listen<string>('ide-save-document', (event) => {
+        const path = event.payload;
+        const files = useFileStore.getState();
+        if (path && files.selectedFile === path) void files.saveFile();
+      }),
+    ];
+    return () => {
+      unsubscribe();
+      pending.forEach((p) => p.then((unlisten) => unlisten()).catch(() => {}));
+    };
+  }, []);
 
   // CLI update detection: check on startup + poll every 30 minutes
   useEffect(() => {
@@ -267,7 +308,8 @@ function App() {
           if (useSessionStore.getState().selectedSessionId !== sessionId) {
             return { switchedTo: sessionId, aborted: true, note: 'User switched away during load' };
           }
-          const { messages, agents } = parseSessionMessages(rawMessages);
+          const { messages, agents, contextTokens } = parseSessionMessages(rawMessages);
+          if (contextTokens) useChatStore.getState().setSessionMeta(sessionId, { contextTokens });
           for (const agent of agents) useAgentStore.getState().upsertAgent(agent);
           for (const message of messages) {
             if ((message as any).toolResultContent) {
@@ -704,6 +746,7 @@ function App() {
         secondary={<SecondaryPanel />}
       />
       <CommandPalette />
+      <GlobalSearchPanel />
       {settingsOpen && <SettingsPanel />}
       <ImageLightbox />
       {showChangelog && currentAppVersion && (

@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "float",
+  "description": "Capability for the floating running-tasks strip",
+  "windows": ["float"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-start-dragging"
+  ]
+}

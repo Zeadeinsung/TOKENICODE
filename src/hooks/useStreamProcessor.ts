@@ -1,5 +1,5 @@
 import { useCallback, useRef, type MutableRefObject } from 'react';
-import { useChatStore, generateMessageId, type ChatMessage } from '../stores/chatStore';
+import { useChatStore, generateMessageId, setTabRemovedCallback, type ChatMessage } from '../stores/chatStore';
 import { useSettingsStore, mapSessionModeToPermissionMode, getEffectiveMode, getEffectiveThinking } from '../stores/settingsStore';
 import { useSessionStore, setOrphanDrainCallback } from '../stores/sessionStore';
 import { useAgentStore, resolveAgentId, getAgentDepth } from '../stores/agentStore';
@@ -10,6 +10,8 @@ import { envFingerprint, resolveModelForProvider, spawnConfigHash, getAutoCompac
 import { buildApiRetryStatus } from '../lib/api-retry';
 import { useProviderStore } from '../stores/providerStore';
 import { t } from '../lib/i18n';
+import { describeToolAction } from '../lib/activity-text';
+import { parseContextUsage, contextTokensFromUsage, contextWindowFromModelUsage } from '../lib/context-usage';
 import {
   clearPreservedThinkingSnapshot,
   filterThinkingDeltaAfterPreservedSnapshot,
@@ -47,6 +49,95 @@ const ERROR_CATEGORIES: ReadonlyArray<{ pattern: RegExp; i18nKey: string }> = [
   { pattern: /not.installed|command.not.found/i, i18nKey: 'error.cliNotInstalled' },
   { pattern: /token.*limit|context.*length|too.long/i, i18nKey: 'error.tokenLimit' },
 ];
+
+// --- Large-payload pruning (memory) ---
+// Every completed tool message retains its full input and result in memory for
+// the lifetime of the session. Long sessions accumulate multiple Write payloads
+// and Read/Grep/Bash outputs, which is the dominant source of the app's memory
+// growth. The CLI's .jsonl session file on disk preserves the complete data, so
+// capping what the live UI holds only costs a re-open of the session.
+const MAX_TOOL_RESULT = 30_000;
+const MAX_WRITE_PREVIEW = 2_000;
+const MAX_EDIT_SNIPPET = 8_000;
+/** Full content of the most recent Write per tab — kept only long enough for an
+ *  ExitPlanMode to build the plan-review card. Bounded by active tab count. */
+const planWriteCache = new Map<string, string>();
+// Free tab-scoped cache entries when the tab is closed.
+setTabRemovedCallback((tabId) => { planWriteCache.delete(tabId); });
+
+function capText(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return `${text.slice(0, max)}\n… [truncated for memory, full content preserved on disk]`;
+}
+
+/** Prune a completed tool message's large payload. Returns partial-message
+ *  updates to merge, or null if nothing needs pruning. */
+function pruneCompletedTool(tabId: string, msg: ChatMessage | undefined): Partial<ChatMessage> | null {
+  if (!msg) return null;
+  const input = msg.toolInput;
+  if (!input || typeof input !== 'object') return null;
+  if (msg.toolName === 'Write' && typeof input.content === 'string' && input.content.length > MAX_WRITE_PREVIEW) {
+    planWriteCache.set(tabId, input.content);
+    return { toolInput: { ...input, content: capText(input.content, MAX_WRITE_PREVIEW) } };
+  }
+  if (msg.toolName === 'Edit') {
+    const next = { ...input };
+    let changed = false;
+    if (typeof next.old_string === 'string' && next.old_string.length > MAX_EDIT_SNIPPET) {
+      next.old_string = capText(next.old_string, MAX_EDIT_SNIPPET);
+      changed = true;
+    }
+    if (typeof next.new_string === 'string' && next.new_string.length > MAX_EDIT_SNIPPET) {
+      next.new_string = capText(next.new_string, MAX_EDIT_SNIPPET);
+      changed = true;
+    }
+    return changed ? { toolInput: next } : null;
+  }
+  return null;
+}
+
+/** Resolve the plan text for the plan-review card: the cached full content of
+ *  the most recent Write (consumed on read), else the last Write still carrying
+ *  its content. Only called immediately before the plan-review card is created,
+ *  so consuming the cache here cannot lose data. */
+function resolvePlanContent(tabId: string, messages: ChatMessage[]): string {
+  const cached = planWriteCache.get(tabId);
+  if (cached) {
+    planWriteCache.delete(tabId);
+    return cached;
+  }
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.type === 'tool_use' && m.toolName === 'Write' && m.toolInput?.content) {
+      return m.toolInput.content;
+    }
+  }
+  return '';
+}
+
+/** Build completion updates for a tool message, applying result truncation and
+ *  input pruning in one place. */
+function completedToolUpdates(tabId: string, parentMsg: ChatMessage | undefined, resultContent: string): Partial<ChatMessage> {
+  const updates: Partial<ChatMessage> = {
+    toolCompleted: true,
+    ...(resultContent ? { toolResultContent: capText(resultContent, MAX_TOOL_RESULT) } : {}),
+  };
+  const pruned = pruneCompletedTool(tabId, parentMsg);
+  if (pruned) Object.assign(updates, pruned);
+  return updates;
+}
+
+/** Test-only seam for payload-pruning regression coverage. */
+export const __pruningTesting = {
+  capText,
+  pruneCompletedTool,
+  resolvePlanContent,
+  completedToolUpdates,
+  MAX_TOOL_RESULT,
+  MAX_WRITE_PREVIEW,
+  MAX_EDIT_SNIPPET,
+  planWriteCache,
+};
 
 export function formatErrorForUser(raw: string): string {
   if (!raw || raw.length < 10) return raw;
@@ -901,12 +992,20 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           }
         }
         // Track tokens in background sessions (per-turn + cumulative total)
-        if (evt.type === 'message_start' && evt.message?.usage?.input_tokens) {
+        if (evt.type === 'message_start' && evt.message?.usage) {
           const bgTab = store.getTab(tabId);
-          const delta = evt.message.usage.input_tokens;
+          const delta = evt.message.usage.input_tokens || 0;
+          // Fully cache-hit calls report input_tokens 0, so gate the counter on
+          // the delta but always refresh the window occupancy.
+          const ctxTokens = contextTokensFromUsage(evt.message.usage);
           store.setSessionMeta(tabId, {
-            inputTokens: (bgTab?.sessionMeta.inputTokens || 0) + delta,
-            totalInputTokens: (bgTab?.sessionMeta.totalInputTokens || 0) + delta,
+            ...(delta
+              ? {
+                  inputTokens: (bgTab?.sessionMeta.inputTokens || 0) + delta,
+                  totalInputTokens: (bgTab?.sessionMeta.totalInputTokens || 0) + delta,
+                }
+              : {}),
+            ...(ctxTokens ? { contextTokens: ctxTokens } : {}),
           });
         }
         if (evt.type === 'message_delta' && evt.usage?.output_tokens) {
@@ -922,6 +1021,16 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
       case 'assistant': {
         // Clear pending command on assistant event (same as foreground)
         completePendingCommand(tabId);
+        // `/context` reply: store the breakdown instead of rendering it.
+        const bgCtxUsage = parseContextUsage((msg as any).context_usage);
+        if (bgCtxUsage) {
+          useChatStore.getState().setSessionMeta(tabId, {
+            contextUsage: bgCtxUsage,
+            ...(bgCtxUsage.totalTokens ? { contextTokens: bgCtxUsage.totalTokens } : {}),
+            ...(bgCtxUsage.maxTokens ? { contextWindow: bgCtxUsage.maxTokens } : {}),
+          });
+          break;
+        }
         const content = msg.message?.content;
         if (!Array.isArray(content)) break;
         // Selectively clear partial in tab — only wipe partialText if a text
@@ -1035,13 +1144,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
                 const bgSnap2 = store.getTab(tabId);
                 let bgPlanContent = '';
                 if (bgSnap2) {
-                  for (let i = bgSnap2.messages.length - 1; i >= 0; i--) {
-                    const m = bgSnap2.messages[i];
-                    if (m.type === 'tool_use' && m.toolName === 'Write' && m.toolInput?.content) {
-                      bgPlanContent = m.toolInput.content;
-                      break;
-                    }
-                  }
+                  bgPlanContent = resolvePlanContent(tabId, bgSnap2.messages);
                 }
                 const bgToolExists = block.id && bgSnap2?.messages.some(
                   (m) => m.id === block.id && m.toolName === 'ExitPlanMode',
@@ -1108,10 +1211,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
                 undefined,
               );
               if (targetId) {
-                store.updateMessage(tabId, targetId, {
-                  toolCompleted: true,
-                  ...(resultText ? { toolResultContent: resultText } : {}),
-                });
+                const parentMsg = store.getTab(tabId)?.messages.find((m) => m.id === targetId);
+                store.updateMessage(tabId, targetId, completedToolUpdates(tabId, parentMsg, resultText));
               }
             }
           }
@@ -1131,10 +1232,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           // Backfill AskUserQuestion type/questions in background tab
           const bgTab = store.getTab(tabId);
           const parentMsg = bgTab?.messages.find((m) => m.id === targetId);
-          const bgUpdates: Partial<ChatMessage> = {
-            toolCompleted: true,
-            ...(resultContent ? { toolResultContent: resultContent } : {}),
-          };
+          const bgUpdates = completedToolUpdates(tabId, parentMsg, resultContent);
           if (parentMsg?.toolName === 'AskUserQuestion') {
             if (parentMsg.type !== 'question') {
               bgUpdates.type = 'question';
@@ -1154,6 +1252,9 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         break;
       }
       case 'result': {
+        // `/context` is a local command; its receipt must not end the turn.
+        if ((msg as any).local_command === 'context'
+          || (msg as any).local_command_run?.command === 'context') break;
         // Capture stopping state BEFORE status update — needed for drain guard below
         const bgWasStopping = store.getTab(tabId)?.sessionStatus === 'stopping';
         const bgResultTab = store.getTab(tabId);
@@ -1210,12 +1311,19 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           const resultOutput = msg.usage?.output_tokens || 0;
           const streamedInput = prevMeta?.inputTokens || 0;
           const streamedOutput = prevMeta?.outputTokens || 0;
+          // result.usage accumulates every API call in the turn, so it is only a
+          // fallback. The authoritative window occupancy comes from message_start.
+          const resultContext = prevMeta?.contextTokens || contextTokensFromUsage(msg.usage);
+          const learnedWindow = contextWindowFromModelUsage((msg as any).modelUsage, prevMeta?.spawnedModel)
+            || prevMeta?.contextWindow;
           store.setSessionMeta(tabId, {
             cost: msg.total_cost_usd,
             duration: msg.duration_ms,
             turns: msg.num_turns,
             inputTokens: resultInput,
             outputTokens: resultOutput,
+            contextTokens: resultContext,
+            ...(learnedWindow ? { contextWindow: learnedWindow } : {}),
             totalInputTokens: (prevMeta?.totalInputTokens || 0) + (resultInput - streamedInput),
             totalOutputTokens: (prevMeta?.totalOutputTokens || 0) + (resultOutput - streamedOutput),
             turnStartTime: undefined,
@@ -1303,7 +1411,9 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         // S13 fix: Auto-compact for background tabs (same as foreground)
         {
           const bgCompactTab = store.getTab(tabId);
-          const bgResultInputTokens = msg.usage?.input_tokens || 0;
+          // Occupancy, not the uncached delta: with prompt caching input_tokens
+          // stays tiny even when the window is nearly full.
+          const bgResultInputTokens = contextTokensFromUsage(msg.usage);
           const bgCompactStdinId = bgCompactTab?.sessionMeta.stdinId;
           const bgCompactThreshold = getAutoCompactThreshold(bgCompactTab?.sessionMeta.spawnedModel);
           if (bgResultInputTokens > bgCompactThreshold && !hasAutoCompactFired(tabId) && bgCompactStdinId && msg.subtype === 'success') {
@@ -1783,6 +1893,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           // TaskCreate/SendMessage (handled by agent registration below).
           const toolName = evt.content_block.name;
           if (shouldCreateStreamingToolPlaceholder(toolName)) {
+            // Input is still streaming at this point, so only the tool name is
+            // known. The assistant branch below fills in the concrete target.
             setActivityStatus({ phase: 'tool', toolName });
             agentActions.updatePhase(agentId, 'tool', toolName);
             addMessage({
@@ -1886,12 +1998,18 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         }
 
         // Track input tokens from message_start (per-turn + cumulative total)
-        if (evt.type === 'message_start' && evt.message?.usage?.input_tokens) {
+        if (evt.type === 'message_start' && evt.message?.usage) {
           const meta = useChatStore.getState().getTab(tabId)?.sessionMeta ?? {};
-          const delta = evt.message.usage.input_tokens;
+          const delta = evt.message.usage.input_tokens || 0;
+          const ctxTokens = contextTokensFromUsage(evt.message.usage);
           setSessionMeta({
-            inputTokens: (meta.inputTokens || 0) + delta,
-            totalInputTokens: (meta.totalInputTokens || 0) + delta,
+            ...(delta
+              ? {
+                  inputTokens: (meta.inputTokens || 0) + delta,
+                  totalInputTokens: (meta.totalInputTokens || 0) + delta,
+                }
+              : {}),
+            ...(ctxTokens ? { contextTokens: ctxTokens } : {}),
           });
         }
 
@@ -1936,6 +2054,18 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         break;
 
       case 'assistant': {
+        // `/context` is a local command: its synthetic assistant message carries
+        // a context_usage breakdown. Keep it out of the transcript and hand it
+        // to the context panel instead.
+        const ctxUsage = parseContextUsage((msg as any).context_usage);
+        if (ctxUsage) {
+          useChatStore.getState().setSessionMeta(tabId, {
+            contextUsage: ctxUsage,
+            ...(ctxUsage.totalTokens ? { contextTokens: ctxUsage.totalTokens } : {}),
+            ...(ctxUsage.maxTokens ? { contextWindow: ctxUsage.maxTokens } : {}),
+          });
+          break;
+        }
         const content = msg.message?.content;
         if (!Array.isArray(content)) break;
 
@@ -2032,7 +2162,13 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
               if (block.name === 'ExitPlanMode') exitPlanModeSeenRef.current = true;
               continue;
             }
-            setActivityStatus({ phase: 'tool', toolName: block.name });
+            // Full tool input is available here, so the activity line can name
+            // the command/file being worked on instead of just the tool.
+            setActivityStatus({
+              phase: 'tool',
+              toolName: block.name,
+              detail: describeToolAction(block.name, block.input).detail,
+            });
             if (block.name === 'Task' || block.name === 'Agent') {
               agentActions.upsertAgent({
                 id: block.id || generateMessageId(),
@@ -2138,14 +2274,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
                   (m) => m.type === 'plan_review' && m.resolved,
                 );
                 if (!(toolAlreadyExisted && existingReview)) {
-                  let planContent = '';
-                  for (let i = currentMessages.length - 1; i >= 0; i--) {
-                    const m = currentMessages[i];
-                    if (m.type === 'tool_use' && m.toolName === 'Write' && m.toolInput?.content) {
-                      planContent = m.toolInput.content;
-                      break;
-                    }
-                  }
+                  const planContent = resolvePlanContent(tabId, currentMessages);
 
                   addMessage({
                     id: 'plan_review_current',
@@ -2247,10 +2376,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
                 undefined,
               );
               if (targetId) {
-                useChatStore.getState().updateMessage(tabId, targetId, {
-                  toolCompleted: true,
-                  ...(resultText ? { toolResultContent: resultText } : {}),
-                });
+                const parentMsg = useChatStore.getState().getTab(tabId)?.messages.find((m) => m.id === targetId);
+                useChatStore.getState().updateMessage(tabId, targetId, completedToolUpdates(tabId, parentMsg, resultText));
               }
             }
           }
@@ -2271,10 +2398,8 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
                 undefined,
               );
               if (targetId) {
-                useChatStore.getState().updateMessage(tabId, targetId, {
-                  toolCompleted: true,
-                  ...(resultText ? { toolResultContent: resultText } : {}),
-                });
+                const parentMsg = useChatStore.getState().getTab(tabId)?.messages.find((m) => m.id === targetId);
+                useChatStore.getState().updateMessage(tabId, targetId, completedToolUpdates(tabId, parentMsg, resultText));
               }
             }
           }
@@ -2302,10 +2427,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           const currentMessages = useChatStore.getState().getTab(tabId)?.messages ?? [];
           const parentMsg = currentMessages.find((m) => m.id === targetId);
           if (parentMsg) {
-            const updates: Partial<ChatMessage> = {
-              toolCompleted: true,
-              ...(resultContent ? { toolResultContent: resultContent } : {}),
-            };
+            const updates = completedToolUpdates(tabId, parentMsg, resultContent);
 
             // Backfill: if parent is AskUserQuestion created with empty questions
             // (due to streaming), or was mis-typed as tool_use, fix it now.
@@ -2336,7 +2458,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           id: msg.uuid || generateMessageId(),
           role: 'assistant',
           type: 'tool_result',
-          content: resultContent,
+          content: capText(resultContent, MAX_TOOL_RESULT),
           toolName: msg.tool_name,
           subAgentDepth: agentDepth,
           timestamp: Date.now(),
@@ -2348,6 +2470,9 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         break;
 
       case 'result': {
+        // `/context` result is a local-command receipt, not a turn boundary.
+        if ((msg as any).local_command === 'context'
+          || (msg as any).local_command_run?.command === 'context') break;
         // Capture stopping state BEFORE any status updates — needed for drain guard later
         const fgResultTab = useChatStore.getState().getTab(tabId);
         const fgWasStopping = fgResultTab?.sessionStatus === 'stopping';
@@ -2690,12 +2815,20 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
           const resultOutput = msg.usage?.output_tokens || 0;
           const streamedInput = meta.inputTokens || 0;
           const streamedOutput = meta.outputTokens || 0;
+          // Keep the message_start value when present; result.usage sums every
+          // API call in the turn and would overstate the window by the number of
+          // tool-loop iterations.
+          const resultContext = meta.contextTokens || contextTokensFromUsage(msg.usage);
+          const learnedWindow = contextWindowFromModelUsage((msg as any).modelUsage, meta.spawnedModel)
+            || meta.contextWindow;
           setSessionMeta({
             cost: msg.total_cost_usd,
             duration: msg.duration_ms,
             turns: msg.num_turns,
             inputTokens: resultInput,
             outputTokens: resultOutput,
+            contextTokens: resultContext,
+            ...(learnedWindow ? { contextWindow: learnedWindow } : {}),
             totalInputTokens: (meta.totalInputTokens || 0) + (resultInput - streamedInput),
             totalOutputTokens: (meta.totalOutputTokens || 0) + (resultOutput - streamedOutput),
             turnStartTime: undefined,
@@ -2747,7 +2880,7 @@ export function useStreamProcessor(config: StreamProcessorConfig) {
         // automatically send /compact to prevent context overflow on the next turn.
         // Fires at most once per session to avoid infinite loops.
         // Threshold is model-aware: 160K for 200K models, 800K for 1M models.
-        const resultInputTokens = msg.usage?.input_tokens || 0;
+        const resultInputTokens = contextTokensFromUsage(msg.usage);
         const compactStdinId = useChatStore.getState().getTab(tabId)?.sessionMeta.stdinId;
         const fgCompactThreshold = getAutoCompactThreshold(useChatStore.getState().getTab(tabId)?.sessionMeta.spawnedModel);
         if (resultInputTokens > fgCompactThreshold && !hasAutoCompactFired(tabId) && compactStdinId && msg.subtype === 'success') {

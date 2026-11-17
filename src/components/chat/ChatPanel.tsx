@@ -1,7 +1,8 @@
-import { useRef, useEffect, useState, useMemo, useCallback } from 'react';
+import { useRef, useEffect, useLayoutEffect, useState, useMemo, useCallback } from 'react';
 import { create } from 'zustand';
 import { useChatStore, useActiveTab, type ChatMessage } from '../../stores/chatStore';
 import { MessageBubble } from './MessageBubble';
+import { ContextPanel } from './ContextPanel';
 import { ToolGroup } from './ToolGroup';
 import { InputBar } from './InputBar';
 import { ExportMenu } from '../conversations/ExportMenu';
@@ -20,11 +21,18 @@ import { spawnSession } from '../../lib/sessionLifecycle';
 import { MarkdownRenderer } from '../shared/MarkdownRenderer';
 import { SetupWizard } from '../setup/SetupWizard';
 import { AiAvatar } from '../shared/AiAvatar';
+import { ClaudeCrab } from '../shared/ClaudeCrab';
 import { UserAvatar } from '../shared/UserAvatar';
 import { useFindInPage } from '../../hooks/useFindInPage';
 import { FindBar } from './FindBar';
+import { useGlobalSearchStore } from '../search/GlobalSearchPanel';
 import { formatElapsedCompact } from '../../lib/elapsed-time';
 import { formatRetryDelaySeconds, isRateLimitRetry, type ApiRetryStatus } from '../../lib/api-retry';
+import { thinkingSummary, toolVerb, writingSummary } from '../../lib/activity-text';
+import { isTaskTool } from '../../lib/cc-tasks';
+
+/** How many transcript items are mounted at once. Older items load on demand. */
+const RENDER_WINDOW = 120;
 
 /** Shared plan panel toggle — used by ChatPanel (panel) and InputBar (button) */
 export const usePlanPanelStore = create<{
@@ -234,14 +242,62 @@ function formatApiRetryText(retry: ApiRetryStatus, t: (key: string) => string): 
   return `${base.replace('{attempt}', attempt ? ` ${attempt}` : '')}${delayText}`;
 }
 
+/** Context window size for the Ctx usage bar — 1M for 1M-variant models and known large-context provider models. */
+function contextWindowFor(modelId: string | undefined): number {
+  const m = (modelId || '').toLowerCase();
+  if (isOneMillionModel(m) || m.includes('v4-pro')) return 1_000_000;
+  return 200_000;
+}
+
+/**
+ * Throttle a fast-changing value for rendering.
+ *
+ * The stream appends text on every animation frame. Re-parsing the whole
+ * accumulated markdown at 60fps pegs the main thread once a reply passes a few
+ * thousand characters, which is what makes streaming look like it is crawling.
+ * 80ms keeps the text visually continuous while cutting parse frequency ~7x.
+ */
+function useThrottledValue<T>(value: T, ms = 80): T {
+  const [snap, setSnap] = useState(value);
+  const latest = useRef(value);
+  const lastFlush = useRef(0);
+  const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    latest.current = value;
+    const now = Date.now();
+    if (now - lastFlush.current >= ms) {
+      lastFlush.current = now;
+      setSnap(value);
+      return;
+    }
+    if (timer.current !== null) return;
+    timer.current = setTimeout(() => {
+      timer.current = null;
+      lastFlush.current = Date.now();
+      setSnap(latest.current);
+    }, ms);
+  }, [value, ms]);
+
+  useEffect(() => () => {
+    if (timer.current !== null) clearTimeout(timer.current);
+  }, []);
+
+  return snap;
+}
+
 /** Activity indicator with elapsed time and token count */
 function ActivityIndicator({ activityStatus, sessionMeta, sessionStatus }: {
-  activityStatus: { phase: string; toolName?: string };
-  sessionMeta: { turnStartTime?: number; outputTokens?: number; inputTokens?: number; lastProgressAt?: number; apiRetry?: ApiRetryStatus };
+  activityStatus: { phase: string; toolName?: string; detail?: string };
+  sessionMeta: { turnStartTime?: number; outputTokens?: number; inputTokens?: number; contextTokens?: number; contextWindow?: number; lastProgressAt?: number; apiRetry?: ApiRetryStatus };
   sessionStatus?: string;
 }) {
   const t = useT();
   const [now, setNow] = useState(Date.now());
+  // Subscribe here rather than receiving props from ChatPanel: token-level
+  // partials must not re-render the whole transcript.
+  const partialThinking = useThrottledValue(useActiveTab((tab) => tab.partialThinking), 200);
+  const partialText = useThrottledValue(useActiveTab((tab) => tab.partialText), 200);
 
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 1000);
@@ -253,13 +309,25 @@ function ActivityIndicator({ activityStatus, sessionMeta, sessionStatus }: {
   const isStarting = sessionStatus === 'running'
     && activityStatus.phase === 'idle';
   const retryText = retryStatus ? formatApiRetryText(retryStatus, t) : null;
+  // Concrete activity text: what the agent is actually doing, in the app's
+  // language (e.g. 运行命令：npm run build / 编辑文件：src/App.tsx).
+  const thinkingText = thinkingSummary(partialThinking);
+  const writingText = writingSummary(partialText);
+  const toolLine = activityStatus.toolName
+    ? activityStatus.detail
+      ? `${toolVerb(activityStatus.toolName)}：${activityStatus.detail}`
+      : toolVerb(activityStatus.toolName)
+    : t('chat.runningTool');
+
   const phaseText = isStopping ? t('chat.stopping')
     : retryText ? retryText
     : isStarting ? t('chat.startingAgent')
-    : activityStatus.phase === 'thinking' ? t('chat.thinking')
-    : activityStatus.phase === 'writing' ? t('chat.writing')
-    : activityStatus.phase === 'tool' ? `${t('chat.runningTool')}: ${activityStatus.toolName || ''}`
-    : activityStatus.phase === 'awaiting' ? t('chat.awaiting')
+    : activityStatus.phase === 'thinking'
+      ? (thinkingText ? t('activity.thinkingWith').replace('{text}', thinkingText) : t('chat.thinking'))
+    : activityStatus.phase === 'writing'
+      ? (writingText ? t('activity.writingWith').replace('{text}', writingText) : t('chat.writing'))
+    : activityStatus.phase === 'tool' ? toolLine
+    : activityStatus.phase === 'awaiting' ? t('activity.awaiting')
     : activityStatus.phase === 'reconnecting' ? t('chat.reconnecting')
     : t('chat.running');
 
@@ -274,8 +342,13 @@ function ActivityIndicator({ activityStatus, sessionMeta, sessionStatus }: {
   const selectedModel = useSettingsStore((s) => s.selectedModel);
   const resolvedModel = resolveModelForProvider(selectedModel);
   const is1MContextModel = isOneMillionModel(resolvedModel);
-  const contextWindow = is1MContextModel ? 1_000_000 : 200_000;
-  const inputTokens = sessionMeta.inputTokens || 0;
+  // CLAUDE_CODE_MAX_CONTEXT_TOKENS overrides the window for every model the
+  // CLI spawns, so it beats the id-based guess here too.
+  const configuredWindow = useSettingsStore((s) => s.claudeMaxContextTokens);
+  const contextWindow = sessionMeta.contextWindow
+    || configuredWindow
+    || (is1MContextModel ? 1_000_000 : 200_000);
+  const inputTokens = sessionMeta.contextTokens || sessionMeta.inputTokens || 0;
   const contextWarning = !isStopping && inputTokens > contextWindow * 0.6;
 
   // Stall detection: 120s of silence (no stream activity), not total elapsed time.
@@ -296,7 +369,7 @@ function ActivityIndicator({ activityStatus, sessionMeta, sessionStatus }: {
           ${isThinking ? '' : 'animate-pulse-soft'}`}>/</span>
       )}
       <span className="text-sm text-text-muted">
-        {isThinking ? <CyclingThinkingText /> : phaseText}
+        {isThinking && !thinkingText ? <CyclingThinkingText /> : phaseText}
         {statsText && (
           <span className={`ml-1.5 ${stallWarning ? 'text-red-400' : 'text-text-tertiary'}`}>{statsText}</span>
         )}
@@ -322,12 +395,109 @@ function ActivityIndicator({ activityStatus, sessionMeta, sessionStatus }: {
   );
 }
 
+/**
+ * Streaming reply bubble: thinking trace + live text.
+ *
+ * Subscribes to partialText / partialThinking itself so token-level updates
+ * re-render only this subtree, not ChatPanel and every history message in it.
+ * Rendering is throttled (see useThrottledValue) and the live markdown render
+ * skips the bare-path regex pass (see MarkdownRenderer's `streaming` prop).
+ */
+function StreamingReply({ messages, onGrow }: {
+  messages: ChatMessage[];
+  onGrow: () => void;
+}) {
+  const t = useT();
+  const isStreaming = useActiveTab((tab) => tab.isStreaming);
+  const partialThinking = useThrottledValue(useActiveTab((tab) => tab.partialThinking));
+  const partialText = useThrottledValue(useActiveTab((tab) => tab.partialText));
+  const thinkingPreRef = useRef<HTMLPreElement>(null);
+
+  // Keep the transcript pinned to the bottom while content grows, unless the
+  // user scrolled up. onGrow is a stable useCallback from ChatPanel.
+  useEffect(() => {
+    if (partialThinking || partialText) onGrow();
+  }, [partialText, partialThinking, onGrow]);
+
+  // Auto-scroll the thinking <pre> as new reasoning streams in.
+  useEffect(() => {
+    const el = thinkingPreRef.current;
+    if (el && partialThinking) el.scrollTop = el.scrollHeight;
+  }, [partialThinking]);
+
+  if (!isStreaming) return null;
+
+  const hasVisiblePartialText = partialText.trim().length > 0;
+
+  // Avatar only on the first assistant text of the turn.
+  let showStreamAvatar = true;
+  for (let j = messages.length - 1; j >= 0; j--) {
+    if (messages[j].role === 'user') break;
+    if (messages[j].role === 'assistant' && messages[j].type === 'text') {
+      showStreamAvatar = false;
+      break;
+    }
+  }
+
+  // Hide streaming text while an unresolved question is pending: the CLI may
+  // keep sending text deltas for the next turn, but the user must answer first.
+  const hasPendingQuestion = messages.some(
+    (m) => m.type === 'question' && !m.resolved
+      && m.interactionState !== 'resolved' && m.interactionState !== 'sending',
+  );
+
+  return (
+    <>
+      {partialThinking && (
+        <div className="ml-11 mr-11 mt-1">
+          <details
+            key={hasVisiblePartialText ? 'collapsed' : 'open'}
+            {...(!hasVisiblePartialText ? { open: true } : {})}
+            className="group"
+          >
+            <summary className="flex items-center gap-1.5 py-1
+              cursor-pointer text-[11px] text-text-tertiary list-none select-none">
+              <svg width="10" height="10" viewBox="0 0 10 10" fill="none"
+                stroke="currentColor" strokeWidth="1.5"
+                className="transition-transform duration-150 group-open:rotate-90">
+                <path d="M3 2l4 3-4 3" />
+              </svg>
+              {t('msg.thinking')}
+              <span className="inline-block w-1.5 h-3 bg-text-tertiary ml-0.5
+                animate-pulse-soft rounded-sm" />
+            </summary>
+            <pre ref={thinkingPreRef} className="ml-5 mt-0.5 text-[11px] text-text-tertiary
+              whitespace-pre-wrap max-h-48 overflow-y-auto
+              font-mono leading-relaxed">
+              {partialThinking}
+            </pre>
+          </details>
+        </div>
+      )}
+      {partialText && !hasPendingQuestion && (
+        <div className="flex gap-3 mt-2">
+          {showStreamAvatar ? (
+            <div className="w-8 h-8 rounded-[10px] bg-accent
+              flex items-center justify-center flex-shrink-0 text-text-inverse
+              text-xs font-bold shadow-md mt-0.5">C</div>
+          ) : (
+            <div className="w-8 flex-shrink-0" />
+          )}
+          <div className="flex-1 min-w-0 text-base text-text-primary leading-relaxed">
+            <MarkdownRenderer content={partialText} streaming />
+          </div>
+          {/* Right gutter mirrors the avatar so streaming text aligns with the user bubble's right edge */}
+          <div className="w-8 flex-shrink-0" />
+        </div>
+      )}
+    </>
+  );
+}
+
 export function ChatPanel() {
   const t = useT();
   const messages = useActiveTab((t) => t.messages);
   const isStreaming = useActiveTab((t) => t.isStreaming);
-  const partialText = useActiveTab((t) => t.partialText);
-  const partialThinking = useActiveTab((t) => t.partialThinking);
   const sessionStatus = useActiveTab((t) => t.sessionStatus);
   const sessionMeta = useActiveTab((t) => t.sessionMeta);
   const activityStatus = useActiveTab((t) => t.activityStatus);
@@ -337,7 +507,10 @@ export function ChatPanel() {
   const toggleSecondaryPanel = useSettingsStore((s) => s.toggleSecondaryPanel);
   const agentPanelOpen = useSettingsStore((s) => s.agentPanelOpen);
   const toggleAgentPanel = useSettingsStore((s) => s.toggleAgentPanel);
+  const floatStripEnabled = useSettingsStore((s) => s.floatStripEnabled);
+  const setFloatStripEnabled = useSettingsStore((s) => s.setFloatStripEnabled);
   const sessionMode = useSettingsStore((s) => s.sessionMode);
+  const selectedModel = useSettingsStore((s) => s.selectedModel);
   const workingDirectory = useSettingsStore((s) => s.workingDirectory);
   const directoryMissing = useFileStore((s) => s.directoryMissing);
   const activeProvider = useProviderStore((s) => {
@@ -345,6 +518,8 @@ export function ChatPanel() {
     return s.providers.find((p) => p.id === s.activeProviderId) ?? null;
   });
   const selectedSessionId = useSessionStore((s) => s.selectedSessionId);
+  const pendingReveal = useSessionStore((s) => s.pendingReveal);
+  const clearReveal = useSessionStore((s) => s.clearReveal);
   const sessions = useSessionStore((s) => s.sessions);
   const isFilePreviewMode = !!useFileStore((s) => s.selectedFile);
 
@@ -360,6 +535,29 @@ export function ChatPanel() {
 
   const showPlanPanel = usePlanPanelStore((s) => s.open);
   const closePlanPanel = usePlanPanelStore((s) => s.close);
+  const [contextPanelOpen, setContextPanelOpen] = useState(false);
+
+  // Ctx usage bar — input tokens vs. model context window
+  const configuredContextWindow = useSettingsStore((s) => s.claudeMaxContextTokens);
+  // Resolve provider mappings first: a historical session has no spawnedModel,
+  // and the globally selected tier (e.g. claude-sonnet-4-6) may be mapped to a
+  // third-party id like deepseek-flash.
+  const ctxModel = resolveModelForProvider(sessionMeta.spawnedModel || selectedModel);
+  // Prefer the window the CLI actually reports (/context or result.modelUsage),
+  // then the explicitly configured CLAUDE_CODE_MAX_CONTEXT_TOKENS (the CLI
+  // applies it to every spawned model), and only then the id-based guess.
+  const ctxWindow = sessionMeta.contextUsage?.maxTokens
+    || sessionMeta.contextWindow
+    || configuredContextWindow
+    || contextWindowFor(ctxModel);
+  // Window occupancy (input + cache read + cache creation), not the uncached delta.
+  const ctxInputTokens = sessionMeta.contextTokens || sessionMeta.inputTokens || 0;
+  const ctxPct = ctxWindow > 0 ? Math.min(100, Math.round((ctxInputTokens / ctxWindow) * 100)) : 0;
+  const ctxBarColor = ctxPct >= 90
+    ? 'bg-red-400'
+    : ctxPct >= 60
+      ? 'bg-amber-400'
+      : 'bg-accent';
 
 
   // Listen for internal file tree drag-drop (mouse-based, not HTML5 drag-and-drop)
@@ -383,21 +581,49 @@ export function ChatPanel() {
     | { kind: 'tool_group'; msgs: ChatMessage[]; startIdx: number };
 
   const displayItems = useMemo<DisplayItem[]>(() => {
+    // TaskCreate / TaskUpdate fire constantly (hundreds of times in a long
+    // session) and are pure checklist bookkeeping. Rendering each as its own
+    // tool card buried the conversation, so keep them out of the transcript.
+    // The floating strip still rebuilds the checklist from `messages`.
+    const visible: Array<{ msg: ChatMessage; idx: number }> = [];
+    messages.forEach((msg, idx) => {
+      if (msg.type === 'tool_use' && isTaskTool(msg.toolName)) return;
+      visible.push({ msg, idx });
+    });
+
+    // Old TodoWrite sends a full snapshot on every call; only the newest one
+    // says anything the previous ones don't.
+    let lastTodoPos = -1;
+    for (let k = visible.length - 1; k >= 0; k--) {
+      if (visible[k].msg.type === 'todo') {
+        lastTodoPos = k;
+        break;
+      }
+    }
+
     const items: DisplayItem[] = [];
     let i = 0;
-    while (i < messages.length) {
+    while (i < visible.length) {
+      if (visible[i].msg.type === 'todo' && i !== lastTodoPos) {
+        i++;
+        continue;
+      }
       // Detect runs of consecutive tool_use messages
-      if (messages[i].type === 'tool_use') {
+      if (visible[i].msg.type === 'tool_use') {
         let j = i;
-        while (j < messages.length && messages[j].type === 'tool_use') j++;
+        while (j < visible.length && visible[j].msg.type === 'tool_use') j++;
         const runLength = j - i;
         if (runLength >= 3) {
-          items.push({ kind: 'tool_group', msgs: messages.slice(i, j), startIdx: i });
+          items.push({
+            kind: 'tool_group',
+            msgs: visible.slice(i, j).map((entry) => entry.msg),
+            startIdx: visible[i].idx,
+          });
           i = j;
           continue;
         }
       }
-      items.push({ kind: 'message', msg: messages[i], idx: i });
+      items.push({ kind: 'message', msg: visible[i].msg, idx: visible[i].idx });
       i++;
     }
     return items;
@@ -416,8 +642,39 @@ export function ChatPanel() {
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const find = useFindInPage(scrollRef);
-  const thinkingPreRef = useRef<HTMLPreElement>(null);
   const isNearBottomRef = useRef(true);
+  // A long transcript mounts tens of thousands of markdown nodes at once, which
+  // pins the WebView renderer at >1GB and makes every click lag. Only the tail
+  // of the list is mounted; older items load on demand.
+  const [renderCount, setRenderCount] = useState(RENDER_WINDOW);
+  const pendingScrollAdjustRef = useRef<number | null>(null);
+  useEffect(() => {
+    setRenderCount(RENDER_WINDOW);
+  }, [selectedSessionId]);
+
+  // A global-search jump targets a message that may sit outside the mounted
+  // window; mount everything so the reveal effect can find it.
+  const revealAll = !!pendingReveal && pendingReveal.sessionId === selectedSessionId;
+  const effectiveRenderCount = revealAll ? displayItems.length : renderCount;
+  const hiddenCount = Math.max(0, displayItems.length - effectiveRenderCount);
+  const visibleItems = hiddenCount > 0 ? displayItems.slice(hiddenCount) : displayItems;
+
+  const loadEarlier = useCallback(() => {
+    const el = scrollRef.current;
+    // Remember the distance to the bottom; keeping it constant across the
+    // prepend leaves the reading position visually unchanged.
+    if (el) pendingScrollAdjustRef.current = el.scrollHeight - el.scrollTop;
+    setRenderCount((c) => c + RENDER_WINDOW);
+  }, []);
+
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    const distFromBottom = pendingScrollAdjustRef.current;
+    if (!el || distFromBottom == null) return;
+    pendingScrollAdjustRef.current = null;
+    el.scrollTop = el.scrollHeight - distFromBottom;
+  }, [hiddenCount]);
+
   // When user scrolls up via wheel, suppress auto-scroll until they return to bottom
   const userScrollingUpRef = useRef(false);
   // Show "scroll to bottom" button when user is far from bottom
@@ -452,20 +709,56 @@ export function ChatPanel() {
     return () => el.removeEventListener('wheel', onWheel);
   }, []);
 
-  // Auto-scroll to bottom only when already near bottom and user isn't scrolling up
-  useEffect(() => {
+  // Auto-scroll to bottom only when already near bottom and user isn't scrolling up.
+  // StreamingReply calls this directly as text grows, so token-level updates no
+  // longer force the whole panel (and every history message) to re-render.
+  const scrollToBottomIfNear = useCallback(() => {
     if (isNearBottomRef.current && !userScrollingUpRef.current && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [messages, partialText, partialThinking, activityStatus]);
+  }, []);
 
-  // Auto-scroll the internal thinking <pre> to bottom as new content streams in
   useEffect(() => {
-    const el = thinkingPreRef.current;
-    if (el && partialThinking) {
-      el.scrollTop = el.scrollHeight;
-    }
-  }, [partialThinking]);
+    scrollToBottomIfNear();
+  }, [messages, activityStatus, scrollToBottomIfNear]);
+
+  // Global-search jump: scroll the picked message into view and flash it. The
+  // messages may still be loading when this lands, so retry briefly rather than
+  // giving up on the first miss (ChatPanel remounts on session switch).
+  useEffect(() => {
+    if (!pendingReveal || pendingReveal.sessionId !== selectedSessionId) return;
+    let cancelled = false;
+    let tries = 0;
+    let timer = 0;
+
+    const attempt = () => {
+      if (cancelled) return;
+      const container = scrollRef.current;
+      const el = container?.querySelector<HTMLElement>(
+        `[data-message-id="${CSS.escape(pendingReveal.messageId)}"]`,
+      );
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        el.classList.remove('reveal-flash');
+        void el.offsetWidth; // restart the animation if it is already applied
+        el.classList.add('reveal-flash');
+        window.setTimeout(() => el.classList.remove('reveal-flash'), 2200);
+        clearReveal();
+        return;
+      }
+      if (tries++ < 30) timer = window.setTimeout(attempt, 100);
+      else clearReveal();
+    };
+
+    attempt();
+    return () => {
+      // The flash timer is deliberately left running: clearing the reveal state
+      // re-runs this effect, and cancelling here would strand the class on the
+      // element with nothing left to remove it.
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [pendingReveal, selectedSessionId, clearReveal]);
 
   return (
     <div className="flex flex-col h-full">
@@ -555,8 +848,45 @@ export function ChatPanel() {
 
         {/* Spacer + right-side actions */}
         <div className="ml-auto flex items-center" />
+        <button
+          type="button"
+          onClick={() => setContextPanelOpen(true)}
+          disabled={!selectedSessionId}
+          className="flex items-center gap-1.5 rounded-lg px-1.5 py-0.5 text-[9px] text-text-tertiary
+            transition-smooth hover:bg-bg-tertiary disabled:cursor-default disabled:hover:bg-transparent"
+          title={t('ctx.tooltip')
+            .replace('{used}', String(Math.round(ctxInputTokens / 1000)))
+            .replace('{total}', String(Math.round(ctxWindow / 1000)))}>
+          <span className="font-medium">Ctx</span>
+          <div className="w-14 h-1.5 bg-bg-tertiary rounded-full overflow-hidden">
+            <div className={`h-full rounded-full transition-all duration-300 ${ctxBarColor}`}
+              style={{ width: `${Math.max(2, ctxPct)}%` }} />
+          </div>
+          <span className="tabular-nums">{ctxPct}%</span>
+        </button>
         <UpdateButton />
         <ExportMenu sessionPath={currentSessionPath} />
+        <button onClick={() => useGlobalSearchStore.getState().toggle()}
+          className="p-1.5 rounded-lg hover:bg-bg-tertiary text-text-tertiary
+            transition-smooth" title={t('search.open')}>
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"
+            stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+            <circle cx="7" cy="7" r="4.5" />
+            <path d="M10.5 10.5L14 14" />
+          </svg>
+        </button>
+        <button onClick={() => setFloatStripEnabled(!floatStripEnabled)}
+          className={`p-1.5 rounded-lg transition-smooth
+            ${floatStripEnabled
+              ? 'bg-accent/10 text-text-secondary'
+              : 'hover:bg-bg-tertiary text-text-tertiary'}`}
+          title={t('float.toggle')}>
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none"
+            stroke="currentColor" strokeWidth="1.5" strokeLinecap="round">
+            <rect x="1" y="3" width="14" height="4" rx="2" />
+            <path d="M4 12h6" />
+          </svg>
+        </button>
         <button onClick={toggleSecondaryPanel}
           className="p-1.5 rounded-lg hover:bg-bg-tertiary text-text-tertiary
             transition-smooth" title={t('chat.toggleFiles')}>
@@ -584,7 +914,19 @@ export function ChatPanel() {
           <EmptyReadyState />
         ) : (
           <div className="max-w-3xl mx-auto">
-            {displayItems.map((item, displayIdx) => {
+            {hiddenCount > 0 && (
+              <div className="flex justify-center mb-4">
+                <button
+                  onClick={loadEarlier}
+                  className="px-3 py-1.5 text-xs rounded-lg bg-bg-elevated border border-border-subtle
+                    text-text-secondary hover:text-text-primary hover:border-border transition-colors"
+                >
+                  {t('chat.loadEarlier')} ({hiddenCount})
+                </button>
+              </div>
+            )}
+            {visibleItems.map((item, i) => {
+              const displayIdx = hiddenCount + i;
               // Determine spacing based on item type
               const isCompact = item.kind === 'tool_group'
                 || (item.kind === 'message' && ['tool_use', 'tool_result', 'thinking', 'todo', 'plan', 'plan_review'].includes(item.msg.type));
@@ -624,79 +966,14 @@ export function ChatPanel() {
                 }
               }
               return (
-                <div key={msg.id} className={spacing}>
+                <div key={msg.id} className={spacing} data-message-id={msg.id}>
                   <MessageBubble message={msg} isFirstInGroup={isFirstInGroup} />
                 </div>
               );
             })}
-            {/* Streaming thinking — auto-collapse as soon as assistant text becomes visible. */}
-            {isStreaming && partialThinking && (() => {
-              const hasVisiblePartialText = partialText.trim().length > 0;
-              return (
-              <div className="ml-11 mr-11 mt-1">
-                <details
-                  key={hasVisiblePartialText ? 'collapsed' : 'open'}
-                  {...(!hasVisiblePartialText ? { open: true } : {})}
-                  className="group"
-                >
-                  <summary className="flex items-center gap-1.5 py-1
-                    cursor-pointer text-[11px] text-text-tertiary list-none select-none">
-                    <svg width="10" height="10" viewBox="0 0 10 10" fill="none"
-                      stroke="currentColor" strokeWidth="1.5"
-                      className="transition-transform duration-150 group-open:rotate-90">
-                      <path d="M3 2l4 3-4 3" />
-                    </svg>
-                    {t('msg.thinking')}
-                    <span className="inline-block w-1.5 h-3 bg-text-tertiary ml-0.5
-                      animate-pulse-soft rounded-sm" />
-                  </summary>
-                  <pre ref={thinkingPreRef} className="ml-5 mt-0.5 text-[11px] text-text-tertiary
-                    whitespace-pre-wrap max-h-48 overflow-y-auto
-                    font-mono leading-relaxed">
-                    {partialThinking}
-                  </pre>
-                </details>
-              </div>
-              );
-            })()}
-            {isStreaming && partialText && (() => {
-              // Hide streaming text while an unresolved question is pending —
-              // the CLI may keep sending text_delta events for the next turn's
-              // content, but the user needs to answer the question first.
-              // Check both resolved flag AND interactionState to handle edge
-              // cases where setInteractionState hasn't propagated yet.
-              const hasPendingQuestion = messages.some(
-                (m) => m.type === 'question' && !m.resolved
-                  && m.interactionState !== 'resolved' && m.interactionState !== 'sending',
-              );
-              if (hasPendingQuestion) return null;
-
-              // Check if there's already an assistant text in this turn
-              let showStreamAvatar = true;
-              for (let j = messages.length - 1; j >= 0; j--) {
-                if (messages[j].role === 'user') break;
-                if (messages[j].role === 'assistant' && messages[j].type === 'text') {
-                  showStreamAvatar = false;
-                  break;
-                }
-              }
-              return (
-              <div className="flex gap-3 mt-2">
-                {showStreamAvatar ? (
-                  <div className="w-8 h-8 rounded-[10px] bg-accent
-                    flex items-center justify-center flex-shrink-0 text-text-inverse
-                    text-xs font-bold shadow-md mt-0.5">C</div>
-                ) : (
-                  <div className="w-8 flex-shrink-0" />
-                )}
-                <div className="flex-1 min-w-0 text-base text-text-primary leading-relaxed">
-                  <MarkdownRenderer content={partialText} />
-                </div>
-                {/* Right gutter mirrors the avatar so streaming text aligns with the user bubble's right edge */}
-                <div className="w-8 flex-shrink-0" />
-              </div>
-              );
-            })()}
+            {/* Streaming thinking + live text. Subscribes internally so token
+                updates re-render only this subtree, not the transcript. */}
+            <StreamingReply messages={messages} onGrow={scrollToBottomIfNear} />
             {/* Pending user messages — queued while AI is streaming.
                 Rendered AFTER partialText bubble so they visually queue up
                 behind the streaming reply. Each one becomes a real user
@@ -787,6 +1064,9 @@ export function ChatPanel() {
           planMessages={planMessages}
           onClose={closePlanPanel}
         />
+      )}
+      {contextPanelOpen && selectedSessionId && (
+        <ContextPanel tabId={selectedSessionId} onClose={() => setContextPanelOpen(false)} />
       )}
       </div>{/* end flex row */}
     </div>
@@ -924,8 +1204,7 @@ function WelcomeScreen() {
 
   return (
     <div className="flex flex-col items-center justify-center h-full text-center">
-      {/* App icon — customizable AI avatar */}
-      <AiAvatar size="w-20 h-20" rounded="rounded-3xl" className="mb-6 shadow-glow" />
+      <ClaudeCrab className="w-[76px] h-auto mb-6" />
       <h2 className="text-xl font-semibold text-accent mb-2">
         {t('chat.welcome')}
       </h2>

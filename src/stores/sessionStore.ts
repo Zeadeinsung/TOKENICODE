@@ -73,6 +73,11 @@ interface SessionState {
   contentSearchResults: Map<string, ContentSearchResult>;
   isContentSearching: boolean;
   contentSearchQuery: string;
+  /** A message the user picked in global search. ConversationList makes sure
+   *  the session is open; ChatPanel scrolls to the message and clears it. */
+  pendingReveal: { sessionId: string; messageId: string } | null;
+  requestReveal: (sessionId: string, messageId: string) => void;
+  clearReveal: () => void;
 
   fetchSessions: () => Promise<void>;
   setSearchQuery: (query: string) => void;
@@ -126,6 +131,7 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
   contentSearchResults: new Map<string, ContentSearchResult>(),
   isContentSearching: false,
   contentSearchQuery: '',
+  pendingReveal: null,
 
   fetchSessions: async () => {
     const isFirstLoad = get().sessions.length === 0;
@@ -329,5 +335,13 @@ export const useSessionStore = create<SessionState>()((set, get) => ({
       isContentSearching: false,
       contentSearchQuery: '',
     });
+  },
+
+  requestReveal: (sessionId, messageId) => {
+    set({ pendingReveal: { sessionId, messageId } });
+  },
+
+  clearReveal: () => {
+    set({ pendingReveal: null });
   },
 }));

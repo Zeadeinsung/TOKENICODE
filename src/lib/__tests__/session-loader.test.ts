@@ -179,3 +179,36 @@ describe('background assistant finalization', () => {
     expect(tab?.isStreaming).toBe(false);
   });
 });
+
+describe('session context occupancy', () => {
+  it('takes window occupancy from the last assistant usage, cache included', () => {
+    const loaded = parseSessionMessages([
+      {
+        type: 'assistant',
+        timestamp: 1,
+        message: {
+          content: [{ type: 'text', text: 'first' }],
+          usage: { input_tokens: 100, cache_read_input_tokens: 5000, cache_creation_input_tokens: 200 },
+        },
+      },
+      {
+        type: 'assistant',
+        timestamp: 2,
+        message: {
+          content: [{ type: 'text', text: 'second' }],
+          usage: { input_tokens: 50, cache_read_input_tokens: 8000, cache_creation_input_tokens: 0 },
+        },
+      },
+    ]);
+
+    expect(loaded.contextTokens).toBe(8050);
+  });
+
+  it('leaves contextTokens undefined when the transcript has no usage', () => {
+    const loaded = parseSessionMessages([
+      { type: 'assistant', timestamp: 1, message: { content: [{ type: 'text', text: 'no usage' }] } },
+    ]);
+
+    expect(loaded.contextTokens).toBeUndefined();
+  });
+});

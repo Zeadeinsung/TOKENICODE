@@ -2,7 +2,9 @@ mod commands;
 pub mod env_manager;
 mod events;
 pub mod path_access;
+mod ide_bridge;
 mod protocol;
+mod remote;
 // windows_ps compiles on all platforms so its pure-logic tests run on
 // non-Windows CI; it is only *invoked* from `#[cfg(target_os = "windows")]`
 // code paths.
@@ -20,7 +22,7 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
 use std::process::Stdio;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::Mutex as TokioMutex;
@@ -132,6 +134,13 @@ fn get_local_git_bash() -> Option<String> {
 /// Returns the path to bash.exe if found.
 #[cfg(target_os = "windows")]
 pub(crate) fn find_git_bash() -> Option<String> {
+    // 0. Explicit override. Users may have Git installed outside the standard
+    //    paths (e.g. D:\tmp\Git); honor the same env var the CLI reads.
+    if let Ok(path) = std::env::var("CLAUDE_CODE_GIT_BASH_PATH") {
+        if std::path::Path::new(&path).exists() {
+            return Some(path);
+        }
+    }
     // 1. Check app-local PortableGit first (auto-installed by TOKENICODE)
     if let Some(local) = get_local_git_bash() {
         return Some(local);
@@ -791,7 +800,7 @@ impl Default for ProvidersFile {
     }
 }
 
-fn providers_path() -> Result<std::path::PathBuf, String> {
+pub(crate) fn providers_path() -> Result<std::path::PathBuf, String> {
     Ok(safe_data_dir()?.join("providers.json"))
 }
 
@@ -1598,7 +1607,10 @@ fn strip_thinking_from_value(value: &mut serde_json::Value) -> Option<usize> {
 /// Reads `~/.claude.json`, extracts the `mcpServers` object, and writes
 /// `{"mcpServers": {...}}` into `~/.tokenicode/mcp-session-<stdin_id>.json`.
 /// Returns `None` when there are no servers to carry over (or on I/O error).
-fn build_mcp_scratch_config(stdin_id: &str) -> Option<std::path::PathBuf> {
+fn build_mcp_scratch_config(
+    stdin_id: &str,
+    ide_server: Option<serde_json::Value>,
+) -> Option<std::path::PathBuf> {
     let home = dirs::home_dir()?;
     let claude_json = home.join(".claude.json");
     let raw = std::fs::read_to_string(&claude_json).ok()?;
@@ -1613,6 +1625,16 @@ fn build_mcp_scratch_config(stdin_id: &str) -> Option<std::path::PathBuf> {
     if let Some(inner) = servers.get("mcpServers").cloned() {
         if inner.is_object() {
             servers = inner;
+        }
+    }
+
+    // tokenicode's IDE bridge: stream-json sessions don't auto-discover IDE
+    // lockfiles, so it is registered like any other MCP server.
+    if let Some(ide) = ide_server {
+        if let Some(map) = servers.as_object_mut() {
+            map.insert("ide".to_string(), ide);
+        } else {
+            servers = serde_json::json!({ "ide": ide });
         }
     }
 
@@ -1670,6 +1692,25 @@ async fn start_claude_session(
     path_access: State<'_, PathAccessManager>,
     params: StartSessionParams,
 ) -> Result<SessionInfo, String> {
+    start_claude_session_inner(
+        app,
+        state.inner().clone(),
+        stdin_mgr.inner().clone(),
+        bypass_modes.inner().clone(),
+        path_access.inner().clone(),
+        params,
+    )
+    .await
+}
+
+pub async fn start_claude_session_inner(
+    app: AppHandle,
+    state: ProcessManager,
+    stdin_mgr: StdinManager,
+    bypass_modes: BypassModeMap,
+    path_access: PathAccessManager,
+    params: StartSessionParams,
+) -> Result<SessionInfo, String> {
     // Phase 3 §3.1: register the per-session cwd as a fixed path-access root
     // so all file commands running in this working directory are allowed.
     path_access
@@ -1709,7 +1750,10 @@ async fn start_claude_session(
     // inside the session. Solution: write the mcpServers block from
     // ~/.claude.json into a scratch file at ~/.tokenicode/mcp-session-<id>.json
     // and pass it via --mcp-config. Cleaned up on process exit.
-    let mcp_scratch_path = build_mcp_scratch_config(&session_id);
+    let ide_server = app
+        .try_state::<crate::ide_bridge::BridgeHandle>()
+        .and_then(|h| crate::ide_bridge::mcp_server_config(h.0.port, &h.0.auth_token));
+    let mcp_scratch_path = build_mcp_scratch_config(&session_id, ide_server);
     if let Some(ref scratch) = mcp_scratch_path {
         args.push("--mcp-config".to_string());
         args.push(scratch.to_string_lossy().to_string());
@@ -1752,6 +1796,13 @@ async fn start_claude_session(
         }
     }
 
+    // Claude Code 2.1.x no longer exposes TodoWrite. Its replacement task
+    // tools (TaskCreate / TaskUpdate / TaskList / TaskGet) are hidden from the
+    // default tool set unless explicitly allowed, so ask for them here — the
+    // floating strip reads their calls to show a live checklist.
+    args.push("--allowedTools".to_string());
+    args.push("TaskCreate,TaskUpdate,TaskList,TaskGet".to_string());
+
     // Permission mode: all modes use --permission-prompt-tool stdio so the CLI
     // routes user interactions (AskUserQuestion, ExitPlanMode) via control_request.
     // In bypassPermissions mode the CLI auto-approves tool permissions internally
@@ -1761,6 +1812,16 @@ async fn start_claude_session(
     args.push(permission_mode.to_string());
     args.push("--permission-prompt-tool".to_string());
     args.push("stdio".to_string());
+
+    // Keep the model's own checklist and narration in Chinese: the floating
+    // strip and the activity line show these strings verbatim. Do not force a
+    // checklist for every task — that steers the model into process overhead
+    // instead of answering the request.
+    args.push("--append-system-prompt".to_string());
+    args.push(
+        "向用户说明正在做什么（思考、执行命令、读写文件）时使用简体中文。确实需要多步跟踪的复杂任务可以用 TaskCreate 建待办，待办的 subject 与 activeForm 使用简体中文；开始某一项时用 TaskUpdate 把它的 status 设为 in_progress，完成一项立即设为 completed。简单问题直接回答，不必建待办。当前编辑器由 tokenicode 托管，用 mcp__ide__ 开头的工具可以读取当前打开的文件、选中文本和诊断信息。"
+            .to_string(),
+    );
 
     // Extended thinking + effort level
     let thinking_level = params.thinking_level.as_deref().unwrap_or("high");
@@ -1887,6 +1948,19 @@ async fn start_claude_session(
         resolved_env
             .entry("MSYS2_ARG_CONV_EXCL".to_string())
             .or_insert_with(|| "*".to_string());
+    }
+
+    // Point the CLI at tokenicode's IDE bridge. The CLI scans
+    // ~/.claude/ide/*.lock, but an explicit port makes the match exact and
+    // lets several editors coexist. Auto-connect is enabled explicitly so the
+    // bridge is picked up even when the workspace folder list is empty.
+    if let Some(handle) = app.try_state::<crate::ide_bridge::BridgeHandle>() {
+        resolved_env
+            .entry("CLAUDE_CODE_SSE_PORT".to_string())
+            .or_insert_with(|| handle.0.port.to_string());
+        resolved_env
+            .entry("CLAUDE_CODE_AUTO_CONNECT_IDE".to_string())
+            .or_insert_with(|| "true".to_string());
     }
 
     // On Windows, auto-detect git-bash and inject CLAUDE_CODE_GIT_BASH_PATH
@@ -2178,11 +2252,11 @@ async fn start_claude_session(
     // Spawn stdout reader — streams NDJSON to frontend, intercepts control_request
     let app_clone = app.clone();
     let sid_clone = sid.clone();
-    let stdin_clone = stdin_mgr.inner().clone();
+    let stdin_clone = stdin_mgr.clone();
     let exit_notify_clone = exit_notify.clone();
-    let state_clone = state.inner().clone();
-    let stdin_mgr_clone = stdin_mgr.inner().clone();
-    let bypass_modes_clone = bypass_modes.inner().clone();
+    let state_clone = state.clone();
+    let stdin_mgr_clone = stdin_mgr.clone();
+    let bypass_modes_clone = bypass_modes.clone();
     let bypass_flag = bypass_modes
         .register(&sid, permission_mode == "bypassPermissions")
         .await;
@@ -2540,6 +2614,14 @@ async fn send_stdin(
     session_id: String,
     message: String,
 ) -> Result<(), String> {
+    send_stdin_inner(stdin_mgr.inner().clone(), session_id, message).await
+}
+
+pub async fn send_stdin_inner(
+    stdin_mgr: StdinManager,
+    session_id: String,
+    message: String,
+) -> Result<(), String> {
     // Wrap user text in stream-json NDJSON format
     let json_msg = serde_json::json!({
         "type": "user",
@@ -2568,7 +2650,43 @@ async fn send_raw_stdin(
 /// Format mirrors exactly what the SDK constructs (from reverse-engineered source).
 #[tauri::command]
 async fn respond_permission(
+    app: AppHandle,
     stdin_mgr: State<'_, StdinManager>,
+    session_id: String,
+    request_id: String,
+    allow: bool,
+    message: Option<String>,
+    tool_use_id: Option<String>,
+    updated_input: Option<Value>,
+) -> Result<(), String> {
+    respond_permission_inner(
+        stdin_mgr.inner().clone(),
+        session_id.clone(),
+        request_id.clone(),
+        allow,
+        message,
+        tool_use_id.clone(),
+        updated_input,
+    )
+    .await?;
+    // Mirror the resolution onto the remote hub so a phone holding the same
+    // question clears it too.
+    let _ = crate::events::emit_to_frontend(
+        &app,
+        "permission:resolved",
+        serde_json::json!({
+            "stdinId": session_id,
+            "requestId": request_id,
+            "toolUseId": tool_use_id,
+            "allow": allow,
+            "source": "desktop",
+        }),
+    );
+    Ok(())
+}
+
+pub async fn respond_permission_inner(
+    stdin_mgr: StdinManager,
     session_id: String,
     request_id: String,
     allow: bool,
@@ -2612,6 +2730,23 @@ async fn respond_permission(
 async fn send_control_request(
     stdin_mgr: State<'_, StdinManager>,
     bypass_modes: State<'_, BypassModeMap>,
+    session_id: String,
+    subtype: String,
+    payload: Value,
+) -> Result<(), String> {
+    send_control_request_inner(
+        stdin_mgr.inner().clone(),
+        bypass_modes.inner().clone(),
+        session_id,
+        subtype,
+        payload,
+    )
+    .await
+}
+
+pub async fn send_control_request_inner(
+    stdin_mgr: StdinManager,
+    bypass_modes: BypassModeMap,
     session_id: String,
     subtype: String,
     payload: Value,
@@ -2791,6 +2926,10 @@ fn load_tracked_sessions() -> std::collections::HashSet<String> {
 /// Register a CLI session ID as managed by TOKENICODE
 #[tauri::command]
 async fn track_session(session_id: String) -> Result<(), String> {
+    track_session_inner(session_id).await
+}
+
+pub async fn track_session_inner(session_id: String) -> Result<(), String> {
     // Defense-in-depth: never persist desk-generated temporary IDs
     if session_id.starts_with("desk_") {
         return Ok(());
@@ -2845,6 +2984,11 @@ fn cleanup_tracked_sessions() {
 /// Delete a session: remove from tracking file and delete the .jsonl file
 #[tauri::command]
 async fn delete_session(session_id: String, session_path: String) -> Result<(), String> {
+    delete_session_inner(session_id, session_path).await
+}
+
+/// Body split out so the remote hub can delete a session from the phone.
+pub async fn delete_session_inner(session_id: String, session_path: String) -> Result<(), String> {
     // Remove from tracking file
     let track_path = tracked_sessions_path();
     if track_path.exists() {
@@ -2889,6 +3033,10 @@ async fn delete_session(session_id: String, session_path: String) -> Result<(), 
 
 #[tauri::command]
 async fn list_sessions() -> Result<Vec<Value>, String> {
+    list_sessions_inner().await
+}
+
+pub async fn list_sessions_inner() -> Result<Vec<Value>, String> {
     let home = dirs::home_dir().ok_or("Cannot find home dir")?;
     let claude_dir = home.join(".claude").join("projects");
 
@@ -2965,6 +3113,11 @@ async fn list_sessions() -> Result<Vec<Value>, String> {
 /// Returns matching sessions with snippets, sorted by match_count descending (max 50).
 #[tauri::command]
 async fn search_sessions(query: String) -> Result<Vec<Value>, String> {
+    search_sessions_inner(query).await
+}
+
+/// Body split out so the remote hub can run the same search from the phone.
+pub async fn search_sessions_inner(query: String) -> Result<Vec<Value>, String> {
     if query.len() < 2 {
         return Ok(vec![]);
     }
@@ -3153,6 +3306,159 @@ fn search_session_file(path: &std::path::Path, query_lower: &str) -> Option<serd
     } else {
         None
     }
+}
+
+/// Concatenate the visible text of one JSONL entry, skipping tool/thinking blocks.
+fn extract_message_text(obj: &Value) -> String {
+    let content = if obj["content"].is_null() {
+        obj["message"]["content"].clone()
+    } else {
+        obj["content"].clone()
+    };
+
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+
+    let Some(blocks) = content.as_array() else {
+        return String::new();
+    };
+
+    let mut parts: Vec<String> = Vec::new();
+    for block in blocks {
+        match block["type"].as_str().unwrap_or("") {
+            "text" => {
+                if let Some(text) = block["text"].as_str() {
+                    parts.push(text.to_string());
+                }
+            }
+            "tool_result" | "tool_use" | "thinking" | "image" => {}
+            _ => {}
+        }
+    }
+    parts.join(" ")
+}
+
+/// Search every tracked session's message text and return one row per matching
+/// message.
+///
+/// `search_sessions` collapses a whole session into a single snippet; this keeps
+/// the individual hits so the UI can list them and jump to the exact message.
+/// The returned `uuid` is the CLI's own message id, which is also what the
+/// frontend uses as the rendered message key.
+#[tauri::command]
+async fn search_messages(query: String, limit: Option<usize>) -> Result<Vec<Value>, String> {
+    use std::io::BufRead;
+
+    let query = query.trim().to_string();
+    let query_chars = query.chars().count();
+    if query_chars < 2 {
+        return Ok(vec![]);
+    }
+
+    let home = dirs::home_dir().ok_or("Cannot find home dir")?;
+    let claude_dir = home.join(".claude").join("projects");
+    if !claude_dir.exists() {
+        return Ok(vec![]);
+    }
+
+    let tracked = load_tracked_sessions();
+    let query_lower = query.to_lowercase();
+    let cap = limit.unwrap_or(200);
+    let mut hits: Vec<Value> = Vec::new();
+
+    'sessions: for dir in std::fs::read_dir(&claude_dir).into_iter().flatten().flatten() {
+        if !dir.path().is_dir() {
+            continue;
+        }
+        for file in std::fs::read_dir(dir.path()).into_iter().flatten().flatten() {
+            let path = file.path();
+            if path.extension().map_or(true, |e| e != "jsonl") {
+                continue;
+            }
+            let session_id = match path.file_stem() {
+                Some(s) => s.to_string_lossy().to_string(),
+                None => continue,
+            };
+            if !tracked.contains(&session_id) {
+                continue;
+            }
+            let Ok(handle) = std::fs::File::open(&path) else {
+                continue;
+            };
+
+            for line in std::io::BufReader::new(handle).lines() {
+                let Ok(line) = line else { continue };
+                if !line.to_lowercase().contains(&query_lower) {
+                    continue;
+                }
+                let Ok(obj) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if obj["isSidechain"].as_bool() == Some(true)
+                    || obj["isMeta"].as_bool() == Some(true)
+                {
+                    continue;
+                }
+
+                let role = match obj["type"].as_str() {
+                    Some("user") | Some("human") => "user",
+                    Some("assistant") => "assistant",
+                    _ => match obj["message"]["role"].as_str() {
+                        Some("user") => "user",
+                        Some("assistant") => "assistant",
+                        _ => continue,
+                    },
+                };
+                let Some(uuid) = obj["uuid"].as_str() else {
+                    continue;
+                };
+
+                let text = extract_message_text(&obj);
+                if text.is_empty() {
+                    continue;
+                }
+
+                let lower_chars: Vec<char> = text.to_lowercase().chars().collect();
+                if lower_chars.len() < query_chars {
+                    continue;
+                }
+                let Some(char_pos) = lower_chars
+                    .windows(query_chars)
+                    .position(|w| w.iter().collect::<String>() == query_lower)
+                else {
+                    continue;
+                };
+
+                let original: Vec<char> = text.chars().collect();
+                let total = original.len();
+                let start = char_pos.saturating_sub(60);
+                let end = std::cmp::min(total, char_pos + query_chars + 60);
+                let mut snippet: String = original[start..end].iter().collect();
+                snippet = snippet.replace('\n', " ").replace('\r', " ");
+                if start > 0 {
+                    snippet = format!("…{snippet}");
+                }
+                if end < total {
+                    snippet = format!("{snippet}…");
+                }
+
+                hits.push(serde_json::json!({
+                    "session_id": session_id,
+                    "uuid": uuid,
+                    "role": role,
+                    "snippet": snippet,
+                    "timestamp": obj["timestamp"].as_str(),
+                }));
+
+                if hits.len() >= cap {
+                    break 'sessions;
+                }
+            }
+        }
+    }
+
+    Ok(hits)
 }
 
 /// Extract preview (first user message) and cwd from a session .jsonl file.
@@ -3398,6 +3704,10 @@ fn decode_project_name(encoded: &str) -> String {
 
 #[tauri::command]
 async fn load_session(path: String) -> Result<Vec<Value>, String> {
+    load_session_inner(path).await
+}
+
+pub async fn load_session_inner(path: String) -> Result<Vec<Value>, String> {
     use std::io::BufRead;
     let file = std::fs::File::open(&path).map_err(|e| format!("Failed to open session: {}", e))?;
     let reader = std::io::BufReader::new(file);
@@ -3407,6 +3717,37 @@ async fn load_session(path: String) -> Result<Vec<Value>, String> {
             if let Ok(json) = serde_json::from_str::<Value>(&line) {
                 messages.push(json);
             }
+        }
+    }
+    Ok(messages)
+}
+
+/// Read the tail of a transcript, capped to roughly `max_bytes` of raw JSONL.
+/// The desktop pulls transcripts over local IPC, but the remote hub ships them
+/// to the phone as a single WebSocket frame. A hundred-megabyte transcript there
+/// is not a slow load — it exceeds the frame limit and kills the connection.
+pub async fn load_session_tail_inner(path: String, max_bytes: u64) -> Result<Vec<Value>, String> {
+    let data = std::fs::read(&path).map_err(|e| format!("Failed to open session: {}", e))?;
+    let mut lines: Vec<&[u8]> = data.split(|&b| b == b'\n').collect();
+    while matches!(lines.last(), Some(l) if l.is_empty()) {
+        lines.pop();
+    }
+    // Walk backwards until the byte budget is spent, so the most recent
+    // messages are the ones that survive the cut.
+    let mut start = lines.len();
+    let mut acc = 0u64;
+    while start > 0 {
+        let len = lines[start - 1].len() as u64 + 1;
+        if acc + len > max_bytes {
+            break;
+        }
+        acc += len;
+        start -= 1;
+    }
+    let mut messages = Vec::with_capacity(lines.len() - start);
+    for line in &lines[start..] {
+        if let Ok(json) = serde_json::from_slice::<Value>(line) {
+            messages.push(json);
         }
     }
     Ok(messages)
@@ -3435,8 +3776,20 @@ async fn reveal_in_finder(path: String) -> Result<(), String> {
     }
     #[cfg(target_os = "windows")]
     {
+        // explorer 要求 /select,"路径" 拼成一个参数；拆成两个会被当成未知参数忽略，
+        // 结果只打开「文档」而不是定位。路径不存在时退到父目录，至少把所在文件夹打开。
+        let p = std::path::Path::new(&path);
+        let target = if p.exists() {
+            path.clone()
+        } else {
+            p.parent()
+                .map(|x| x.to_string_lossy().to_string())
+                .filter(|x| !x.is_empty())
+                .unwrap_or_else(|| path.clone())
+        };
         let mut cmd = Command::new("explorer");
-        cmd.args(["/select,", &path]);
+        // 前端传来的路径是正斜杠，explorer 对 / 的处理并不可靠，统一换成反斜杠
+        cmd.raw_arg(format!("/select,\"{}\"", target.replace('/', "\\")));
         cmd.creation_flags(0x08000000);
         cmd.spawn()
             .map_err(|e| format!("Failed to reveal in Explorer: {}", e))?;
@@ -3454,6 +3807,21 @@ async fn reveal_in_finder(path: String) -> Result<(), String> {
             .map_err(|e| format!("Failed to reveal in file manager: {}", e))?;
     }
     Ok(())
+}
+
+/// 只读预览聊天里点到的文件。
+///
+/// 和 read_file_content 不同，这条命令不经过 PathAccessManager：聊天里给出的
+/// 路径经常在文件树之外（`~/.claude.json`、跨项目绝对路径），而定位查看属于
+/// 用户主动操作。只允许读、上限 1MB，不能写。
+#[tauri::command]
+async fn read_file_for_reveal(path: String) -> Result<String, String> {
+    let p = std::path::Path::new(&path);
+    let metadata = std::fs::metadata(p).map_err(|e| format!("Cannot read file: {}", e))?;
+    if metadata.len() > 1_048_576 {
+        return Err("File too large (>1MB)".to_string());
+    }
+    std::fs::read_to_string(p).map_err(|e| format!("Cannot read file: {}", e))
 }
 
 #[tauri::command]
@@ -4239,6 +4607,10 @@ async fn export_session_json(path: String, output_path: String) -> Result<(), St
 /// List recent projects by scanning ~/.claude/projects/ directory names
 #[tauri::command]
 async fn list_recent_projects() -> Result<Vec<Value>, String> {
+    list_recent_projects_inner().await
+}
+
+pub async fn list_recent_projects_inner() -> Result<Vec<Value>, String> {
     let home = dirs::home_dir().ok_or("Cannot find home dir")?;
     let projects_dir = home.join(".claude").join("projects");
 
@@ -4800,6 +5172,40 @@ async fn list_skills(cwd: Option<String>) -> Result<Vec<SkillInfo>, String> {
             .join(".claude")
             .join("skills");
         skills.extend(scan_skills_dir(&project_dir, "project"));
+    }
+
+    // Plugin skills: ~/.claude/plugins/cache/<marketplace>/<plugin>/<version>/{skills,.claude/skills}/
+    // These are the skills shipped by installed plugins (adspecs, caveman, design-mastery, etc.).
+    if let Some(home) = dirs::home_dir() {
+        let cache = home.join(".claude").join("plugins").join("cache");
+        if let Ok(marketplaces) = std::fs::read_dir(&cache) {
+            for mp in marketplaces.flatten() {
+                let mp_path = mp.path();
+                if !mp_path.is_dir() {
+                    continue;
+                }
+                if let Ok(plugins) = std::fs::read_dir(&mp_path) {
+                    for plg in plugins.flatten() {
+                        let plg_path = plg.path();
+                        if !plg_path.is_dir() {
+                            continue;
+                        }
+                        if let Ok(versions) = std::fs::read_dir(&plg_path) {
+                            for ver in versions.flatten() {
+                                let ver_path = ver.path();
+                                if !ver_path.is_dir() {
+                                    continue;
+                                }
+                                skills.extend(scan_skills_dir(&ver_path.join("skills"), "plugin"));
+                                skills.extend(
+                                    scan_skills_dir(&ver_path.join(".claude").join("skills"), "plugin"),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(skills)
@@ -5416,6 +5822,28 @@ fn remove_corrupt_claude_exe(suspect_path: &str) {
             }
         }
     }
+}
+
+/// Read the `env` block of the user's ~/.claude/settings.json.
+///
+/// The UI needs CLAUDE_CODE_MAX_CONTEXT_TOKENS (and similar) to measure the Ctx
+/// bar against the window the CLI actually uses; the file is outside any project
+/// root, so it cannot go through the generic file commands.
+#[tauri::command]
+async fn read_claude_env() -> Result<HashMap<String, String>, String> {
+    let home = dirs::home_dir().ok_or_else(|| "home directory not found".to_string())?;
+    let path = home.join(".claude").join("settings.json");
+    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let mut env = HashMap::new();
+    if let Some(obj) = value.get("env").and_then(|v| v.as_object()) {
+        for (key, item) in obj {
+            if let Some(text) = item.as_str() {
+                env.insert(key.clone(), text.to_string());
+            }
+        }
+    }
+    Ok(env)
 }
 
 /// Check whether the Claude CLI is installed and return its path and version.
@@ -7621,7 +8049,7 @@ async fn check_claude_auth() -> Result<AuthStatus, String> {
 }
 
 /// Path to the session-names metadata file (~/.claude/tokenicode_session_names.json).
-fn session_names_path() -> Result<std::path::PathBuf, String> {
+pub(crate) fn session_names_path() -> Result<std::path::PathBuf, String> {
     let home = dirs::home_dir().ok_or("Cannot find home dir")?;
     Ok(home.join(".claude").join("tokenicode_session_names.json"))
 }
@@ -7647,7 +8075,7 @@ async fn save_custom_previews(data: Value) -> Result<(), String> {
     std::fs::write(&path, content).map_err(|e| format!("Failed to write session names: {}", e))
 }
 
-fn tokenicode_data_path(filename: &str) -> Result<std::path::PathBuf, String> {
+pub(crate) fn tokenicode_data_path(filename: &str) -> Result<std::path::PathBuf, String> {
     let home = dirs::home_dir().ok_or("Cannot find home dir")?;
     let dir = home.join(".tokenicode");
     if !dir.exists() {
@@ -8025,6 +8453,215 @@ async fn set_dock_icon(app: AppHandle, png_base64: String) -> Result<(), String>
     Ok(())
 }
 
+/// Label of the always-on-top "running tasks" rail.
+const FLOAT_WINDOW_LABEL: &str = "float";
+
+/// Width of the dot rail when no task panel is open (must match RAIL_WIDTH in
+/// FloatingStrip.tsx).
+const FLOAT_RAIL_WIDTH: f64 = 52.0;
+/// Gap kept between the window and the right edge of the screen.
+const FLOAT_SCREEN_MARGIN: f64 = 10.0;
+const FLOAT_MIN_HEIGHT: f64 = 44.0;
+const FLOAT_MAX_HEIGHT: f64 = 640.0;
+/// Rail plus the widest todo panel.
+const FLOAT_MAX_WIDTH: f64 = 420.0;
+
+/// Set while the app is shutting down so the float window's `CloseRequested`
+/// handler stops turning `close()` back into `hide()`.
+static ALLOW_FLOAT_CLOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set once the user drags the strip. From then on resizes keep the position
+/// they chose instead of snapping back to the screen edge.
+static FLOAT_USER_POSITIONED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Create the floating tasks rail: transparent, borderless, always on top,
+/// excluded from the taskbar. It starts hidden and is shown by
+/// `set_float_visible` once the main window's bridge reports its first state.
+#[cfg(desktop)]
+fn setup_float_window(app: &AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri::{WebviewUrl, WebviewWindowBuilder};
+
+    let width = FLOAT_RAIL_WIDTH;
+    let height = 80.0_f64;
+    let window = WebviewWindowBuilder::new(app, FLOAT_WINDOW_LABEL, WebviewUrl::App("floating.html".into()))
+        .inner_size(width, height)
+        .decorations(false)
+        .transparent(true)
+        .always_on_top(true)
+        .skip_taskbar(true)
+        .resizable(false)
+        .shadow(false)
+        .visible(false)
+        .focused(false)
+        .build()?;
+
+    // No acrylic on Windows: the system backdrop paints the whole window
+    // rectangle and ignores SetWindowRgn, which leaves a square plate behind
+    // the pill. The rail's own CSS supplies the frosted tint instead.
+    #[cfg(target_os = "macos")]
+    {
+        use window_vibrancy::{apply_vibrancy, NSVisualEffectMaterial};
+        let _ = apply_vibrancy(&window, NSVisualEffectMaterial::HudWindow, None, Some(12.0));
+    }
+
+    // Right edge of the primary monitor, vertically centred. Done before the
+    // first `show()` so the rail never flashes at the wrong place.
+    if let Ok(Some(monitor)) = app.primary_monitor() {
+        let (x, y) = float_anchor(&monitor, width, height);
+        let _ = window.set_position(tauri::LogicalPosition::new(x, y));
+    }
+
+    #[cfg(target_os = "windows")]
+    apply_float_shape(&window, width, height);
+
+    Ok(())
+}
+
+/// Clip the float window to its visible outline. Acrylic tints the whole window
+/// rectangle, so without this the strip reads as a square even though every dot
+/// inside it is round. Collapsed, the region is a pill (the cap diameter equals
+/// the rail width); with the todo panel open it falls back to the panel's 14px
+/// corners.
+#[cfg(target_os = "windows")]
+fn apply_float_shape(window: &tauri::WebviewWindow, width: f64, height: f64) {
+    use std::ffi::c_void;
+
+    #[link(name = "gdi32")]
+    extern "system" {
+        fn CreateRoundRectRgn(x1: i32, y1: i32, x2: i32, y2: i32, w: i32, h: i32) -> *mut c_void;
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn SetWindowRgn(hwnd: *mut c_void, rgn: *mut c_void, redraw: i32) -> i32;
+    }
+
+    let Ok(scale) = window.scale_factor() else {
+        return;
+    };
+    let Ok(hwnd) = window.hwnd() else {
+        return;
+    };
+    let w = (width * scale).round().max(1.0) as i32;
+    let h = (height * scale).round().max(1.0) as i32;
+    let rail = (FLOAT_RAIL_WIDTH * scale).round() as i32;
+    // CreateRoundRectRgn takes the cap's diameter, not a radius.
+    let (cap_w, cap_h) = if w <= rail + 1 {
+        (w, w.min(h))
+    } else {
+        let d = (28.0 * scale).round() as i32;
+        (d, d)
+    };
+    unsafe {
+        let rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, cap_w, cap_h);
+        if rgn.is_null() {
+            return;
+        }
+        let _ = SetWindowRgn(hwnd.0 as *mut c_void, rgn, 1);
+    }
+}
+
+/// Screen position that keeps the float window pinned to the right edge and
+/// vertically centred, whatever size it currently asks for.
+#[cfg(desktop)]
+fn float_anchor(monitor: &tauri::Monitor, width: f64, height: f64) -> (f64, f64) {
+    let scale = monitor.scale_factor();
+    let origin_x = monitor.position().x as f64 / scale;
+    let origin_y = monitor.position().y as f64 / scale;
+    let screen_w = monitor.size().width as f64 / scale;
+    let screen_h = monitor.size().height as f64 / scale;
+    (
+        origin_x + (screen_w - width - FLOAT_SCREEN_MARGIN).max(0.0),
+        origin_y + ((screen_h - height) / 2.0).max(0.0),
+    )
+}
+
+/// Show or hide the floating tasks strip.
+#[tauri::command]
+fn set_float_visible(app: AppHandle, visible: bool) -> Result<(), String> {
+    let window = app
+        .get_webview_window(FLOAT_WINDOW_LABEL)
+        .ok_or_else(|| "float window not found".to_string())?;
+    if visible {
+        window.show().map_err(|e| e.to_string())
+    } else {
+        window.hide().map_err(|e| e.to_string())
+    }
+}
+
+/// Resize the rail while its todo panel expands or collapses. The window keeps
+/// its right edge and its vertical centre fixed, so opening a panel grows it to
+/// the left instead of pushing the dots around. `resizable(false)` only stops
+/// the user from dragging an edge; programmatic resizes still work.
+#[tauri::command]
+fn set_float_bounds(app: AppHandle, width: f64, height: f64) -> Result<(), String> {
+    let window = app
+        .get_webview_window(FLOAT_WINDOW_LABEL)
+        .ok_or_else(|| "float window not found".to_string())?;
+    let w = width.clamp(FLOAT_RAIL_WIDTH, FLOAT_MAX_WIDTH);
+    let h = height.clamp(FLOAT_MIN_HEIGHT, FLOAT_MAX_HEIGHT);
+
+    // After a manual drag the strip belongs to the user: keep its right edge
+    // and vertical centre where they put it. Before that, stay pinned to the
+    // screen edge.
+    let manual = FLOAT_USER_POSITIONED.load(std::sync::atomic::Ordering::SeqCst);
+    let before = if manual {
+        window
+            .outer_position()
+            .ok()
+            .zip(window.outer_size().ok())
+    } else {
+        None
+    };
+
+    window
+        .set_size(tauri::LogicalSize::new(w, h))
+        .map_err(|e| e.to_string())?;
+
+    if let Some((pos, size)) = before {
+        let scale = window.scale_factor().unwrap_or(1.0);
+        let nw = (w * scale).round() as i32;
+        let nh = (h * scale).round() as i32;
+        let x = pos.x + size.width as i32 - nw;
+        let y = pos.y + (size.height as i32 - nh) / 2;
+        let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+    } else {
+        let monitor = window
+            .current_monitor()
+            .ok()
+            .flatten()
+            .or_else(|| app.primary_monitor().ok().flatten());
+        if let Some(monitor) = monitor {
+            let (x, y) = float_anchor(&monitor, w, h);
+            let _ = window.set_position(tauri::LogicalPosition::new(x, y));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    apply_float_shape(&window, w, h);
+    Ok(())
+}
+
+/// Called when the user starts dragging the strip. Marks the window as
+/// user-positioned so the next `set_float_bounds` does not snap it back.
+#[tauri::command]
+fn float_take_over_position() {
+    FLOAT_USER_POSITIONED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Bring the main window back from minimised, focus it, and ask it to switch
+/// to `tab_id`. Used when the user clicks a row on the strip.
+#[tauri::command]
+fn focus_main_and_select(app: AppHandle, tab_id: String) -> Result<(), String> {
+    let main = app
+        .get_webview_window(events::MAIN_WINDOW_LABEL)
+        .ok_or_else(|| "main window not found".to_string())?;
+    let _ = main.unminimize();
+    main.show().map_err(|e| e.to_string())?;
+    main.set_focus().map_err(|e| e.to_string())?;
+    app.emit_to(events::MAIN_WINDOW_LABEL, "float:select", tab_id)
+        .map_err(|e| e.to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -8037,6 +8674,28 @@ pub fn run() {
         .manage(WatcherManager::default())
         .manage(PathAccessManager::new())
         .plugin(tauri_plugin_process::init())
+        .on_window_event(|window, event| {
+            let tauri::WindowEvent::CloseRequested { api, .. } = event else {
+                return;
+            };
+            let label = window.label().to_string();
+            if label == FLOAT_WINDOW_LABEL
+                && !ALLOW_FLOAT_CLOSE.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                // The strip is not a real window: closing it just hides it.
+                // Without this the app would quit the moment the user dismisses
+                // the strip while the main window is minimised.
+                api.prevent_close();
+                let _ = window.hide();
+            } else if label == events::MAIN_WINDOW_LABEL {
+                // Genuine quit: let the strip die with the app instead of
+                // lingering hidden and keeping the process alive.
+                ALLOW_FLOAT_CLOSE.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(float) = window.app_handle().get_webview_window(FLOAT_WINDOW_LABEL) {
+                    let _ = float.close();
+                }
+            }
+        })
         .setup(|app| {
             // titleBarStyle: "Overlay" in tauri.conf.json handles macOS traffic lights
             // and native titlebar drag/double-click-to-maximize automatically.
@@ -8081,6 +8740,25 @@ pub fn run() {
             #[cfg(not(desktop))]
             let _ = app;
 
+            // Start the remote mirror/control server (phone access over Tailscale).
+            // Failures are logged inside and never block app startup.
+            let _ = tauri::async_runtime::spawn(crate::remote::start(app.handle().clone()));
+
+            // IDE integration bridge: the CLI discovers this WebSocket server
+            // through ~/.claude/ide/<port>.lock and exposes our tools as
+            // mcp__ide__* (selection, open editors, diagnostics, diffs).
+            crate::ide_bridge::start(app.handle().clone());
+
+            // The floating "running tasks" strip. Its webview is a separate JS
+            // context, so it imports nothing from the app bundle — the main
+            // window feeds it via `emitTo("float", "float:state", ...)`.
+            // A failure here costs the strip, not the app, so it is logged
+            // rather than propagated.
+            #[cfg(desktop)]
+            if let Err(e) = setup_float_window(app.handle()) {
+                eprintln!("[float] failed to create the tasks strip: {e}");
+            }
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -8093,6 +8771,7 @@ pub fn run() {
             delete_session,
             list_sessions,
             search_sessions,
+            search_messages,
             load_session,
             add_path_grant,
             clear_path_grants,
@@ -8107,6 +8786,7 @@ pub fn run() {
             open_in_vscode,
             reveal_in_finder,
             open_with_default_app,
+            read_file_for_reveal,
             share_file,
             share_to_wechat,
             export_session_markdown,
@@ -8128,8 +8808,13 @@ pub fn run() {
             run_git_command,
             rewind_files,
             set_dock_icon,
+            set_float_visible,
+            set_float_bounds,
+            float_take_over_position,
+            focus_main_and_select,
             run_claude_command,
             check_claude_cli,
+            read_claude_env,
             diagnose_cli,
             cleanup_old_cli,
             pin_cli,
@@ -8162,6 +8847,9 @@ pub fn run() {
             send_control_request,
             commands::feedback::submit_feedback,
             commands::feedback::feedback_is_configured,
+            ide_bridge::ide_update_editor_state,
+            ide_bridge::ide_update_diagnostics,
+            ide_bridge::ide_bridge_port,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

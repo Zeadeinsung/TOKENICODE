@@ -1,6 +1,7 @@
 import type { ChatMessage } from '../stores/chatStore';
 import { generateMessageId } from '../stores/chatStore';
 import type { AgentPhase } from '../stores/agentStore';
+import { contextTokensFromUsage } from './context-usage';
 
 export interface AgentData {
   id: string;
@@ -16,6 +17,9 @@ export interface LoadedSession {
   messages: ChatMessage[];
   agents: AgentData[];
   mainAgentStartTime: number;
+  /** Window occupancy from the last assistant turn, so a session loaded from
+   *  disk shows its real Ctx usage instead of 0%. */
+  contextTokens?: number;
 }
 
 /** Detect system-injected content that should not be shown to users */
@@ -35,6 +39,7 @@ function isSystemText(text: string): boolean {
 export function parseSessionMessages(rawMessages: any[]): LoadedSession {
   const messages: ChatMessage[] = [];
   const agents: AgentData[] = [];
+  let lastContextTokens = 0;
 
   // Create main agent with session start time
   const firstMsg = rawMessages[0];
@@ -167,6 +172,8 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
         });
       }
     } else if (msg.type === 'assistant') {
+      const usageTokens = contextTokensFromUsage(msg.message?.usage ?? msg.usage);
+      if (usageTokens > 0) lastContextTokens = usageTokens;
       const blocks = msg.message?.content;
       if (Array.isArray(blocks)) {
         for (const block of blocks) {
@@ -263,5 +270,10 @@ export function parseSessionMessages(rawMessages: any[]): LoadedSession {
     }
   }
 
-  return { messages, agents, mainAgentStartTime: sessionStartTime };
+  return {
+    messages,
+    agents,
+    mainAgentStartTime: sessionStartTime,
+    contextTokens: lastContextTokens || undefined,
+  };
 }

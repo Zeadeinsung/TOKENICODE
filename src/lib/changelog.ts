@@ -19,6 +19,40 @@ export interface ChangelogEntry {
  */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: '0.12.0',
+    date: '2026-10-29',
+    highlights: {
+      zh: [
+        '活动状态显示具体动作：运行命令、读取 / 编辑哪个文件、思考到哪一步',
+        '顶部浮窗常驻待办进度，悬停任务展开完整清单',
+        '待办与过程说明默认用简体中文书写',
+      ],
+      en: [
+        'Activity line now names the command, file and last thought instead of only the tool',
+        'The floating strip keeps todo progress visible; hover a task to expand its checklist',
+        'Todo entries and progress narration default to Simplified Chinese',
+      ],
+    },
+    categories: [
+      {
+        label: { zh: '新增', en: 'New' },
+        items: {
+          zh: [
+            '活动状态具体化 — 聊天底部显示「运行命令：npm run build」「读取文件：src/App.tsx」「编辑文件：…」；思考阶段显示思考内容的最后一句，输出阶段显示正在写的内容摘要',
+            '终端命令翻译成人话 — tsc、npm/pnpm 脚本、测试、git、构建、文件操作等常见命令显示为中文意图，并注明超时与日志路径；未识别的命令仍显示原文',
+            '浮窗待办常驻 — 浮窗每行显示任务名、当前动作与「待办 2/5」；鼠标悬停任务时在下方展开完整待办清单，含进度条、进行中项与 activeForm，移出后窗口收回 52px',
+            '待办中文化 — 启动 CLI 时追加提示，要求 TodoWrite 的 content / activeForm 用简体中文，过程说明也用中文',
+          ],
+          en: [
+            'Concrete activity line — shows "Running: npm run build", "Reading: src/App.tsx", "Editing: …"; thinking shows the last thought and writing shows a summary of the text being produced',
+            'Todos on the floating strip — each row shows the task, current action and "Todos 2/5"; hovering expands the full checklist with a progress bar, in-progress item and activeForm, then collapses back to 52px',
+            'Chinese todos — an appended system prompt asks TodoWrite to write content / activeForm in Simplified Chinese, along with progress narration',
+          ],
+        },
+      },
+    ],
+  },
+  {
     version: '0.11.0',
     date: '2026-06-10',
     highlights: {

@@ -68,6 +68,7 @@ export function SkillsPanel() {
   // Group skills by scope
   const globalSkills = filteredSkills.filter((s) => s.scope === 'global').sort(sortByName);
   const projectSkills = filteredSkills.filter((s) => s.scope === 'project').sort(sortByName);
+  const pluginSkills = filteredSkills.filter((s) => s.scope === 'plugin').sort(sortByName);
 
   const handleSelect = useCallback((skill: SkillInfo) => {
     selectFile(skill.path);
@@ -244,6 +245,17 @@ export function SkillsPanel() {
               <SkillGroup
                 label={t('skills.global')}
                 skills={globalSkills}
+                selectedFile={selectedFile}
+                onSelect={handleSelect}
+                onOpenMenu={handleOpenMenu}
+                onToggleEnabled={toggleEnabled}
+                t={t}
+              />
+            )}
+            {pluginSkills.length > 0 && (
+              <SkillGroup
+                label={t('skills.plugin')}
+                skills={pluginSkills}
                 selectedFile={selectedFile}
                 onSelect={handleSelect}
                 onOpenMenu={handleOpenMenu}
@@ -444,8 +456,12 @@ function SkillCard({
         </span>
         <span className={`flex-shrink-0 w-3.5 h-3.5 rounded text-[8px]
           font-bold flex items-center justify-center
-          ${skill.scope === 'global' ? 'bg-blue-500/20 text-blue-400' : 'bg-green-500/20 text-green-400'}`}>
-          {skill.scope === 'global' ? 'G' : 'P'}
+          ${skill.scope === 'global'
+            ? 'bg-blue-500/20 text-blue-400'
+            : skill.scope === 'plugin'
+              ? 'bg-purple-500/20 text-purple-400'
+              : 'bg-green-500/20 text-green-400'}`}>
+          {skill.scope === 'global' ? 'G' : skill.scope === 'plugin' ? 'M' : 'P'}
         </span>
 
         {/* Toggle switch */}

@@ -1,9 +1,11 @@
-import { describe, it, expect } from 'vitest';
+import { afterEach, describe, it, expect } from 'vitest';
 import {
+  getAutoCompactThreshold,
   getModelDisplayOptions,
   getSelectedModelOptionId,
   shouldUseProviderModelOptions,
 } from '../api-provider';
+import { useSettingsStore } from '../../stores/settingsStore';
 import type { ApiProvider } from '../../stores/providerStore';
 
 function provider(overrides: Partial<ApiProvider> = {}): ApiProvider {
@@ -89,5 +91,25 @@ describe('provider model display options', () => {
     expect(getSelectedModelOptionId('claude-fable-5', options)).toBe('claude-opus-4-8');
     expect(getSelectedModelOptionId('claude-opus-4-6', options)).toBe('claude-opus-4-8');
     expect(getSelectedModelOptionId('claude-sonnet-4-6', options)).toBe('claude-sonnet-4-6');
+  });
+});
+
+describe('getAutoCompactThreshold', () => {
+  afterEach(() => {
+    useSettingsStore.getState().setClaudeMaxContextTokens(0);
+  });
+
+  it('compacts at 80% of a 200K window by default', () => {
+    expect(getAutoCompactThreshold('claude-sonnet-4-6')).toBe(160_000);
+  });
+
+  it('compacts at 80% of the configured CLAUDE_CODE_MAX_CONTEXT_TOKENS', () => {
+    useSettingsStore.getState().setClaudeMaxContextTokens(1_000_000);
+    expect(getAutoCompactThreshold('claude-sonnet-4-6')).toBe(800_000);
+    expect(getAutoCompactThreshold('deepseek-flash')).toBe(800_000);
+  });
+
+  it('falls back to the 1M model id when nothing is configured', () => {
+    expect(getAutoCompactThreshold('claude-opus-4-8[1m]')).toBe(800_000);
   });
 });

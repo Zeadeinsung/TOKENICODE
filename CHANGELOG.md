@@ -6,6 +6,23 @@ All notable changes to TOKENICODE will be documented in this file.
 
 ---
 
+## [0.12.0] - 2026-10-29
+
+### 新增
+
+- **活动状态显示具体动作** —— 聊天底部的活动行不再只写「运行工具: Bash」，而是 `运行命令：npm run build`、`读取文件：src/App.tsx`、`编辑文件：…`。思考阶段显示思考内容的最后一句，输出阶段显示正在写的内容摘要。工具名与动作文案跟随界面语言（中文 / 英文）。
+- **终端命令翻译成人话** —— 常见命令按意图显示：`timeout 180 ./node_modules/.bin/tsc --noEmit > log` 显示为「类型检查 TypeScript 项目（限时 180 秒，结果写入 .run/tsc_label.log）」，npm/pnpm 脚本、测试、git、构建、文件操作等均有对应说法；去掉 `timeout`/`npx`/`cd &&` 等包装，未识别的命令仍显示原文。聊天里的工具卡片在「终端」标签旁同步显示这句说明。
+- **顶部浮窗常驻待办** —— 浮窗每行显示任务名、当前动作和 `待办 2/5` 进度；鼠标悬停某个任务，在浮条下方展开该任务的完整待办清单（完成 / 进行中 / 待开始、进度条、进行中项显示 `activeForm`）。窗口高度随面板自动伸缩，移出后收回 52px。
+- **待办用中文书写** —— 启动 CLI 时追加 `--append-system-prompt`，要求 TodoWrite 的 `content` / `activeForm` 使用简体中文，并让过程说明也用中文。
+
+### 内部
+
+- `ActivityStatus` 增加 `detail` 字段，工具动作的格式化集中在 `src/lib/activity-text.ts`；`MessageBubble` 复用其中的 `shortPath`。
+- 浮窗数据快照新增 `action` / `todos` / `todoDone` / `todoTotal`，并按待办状态与动作变化触发推送；扫待办结果按消息条数缓存，避免大会话上重复遍历。
+- Rust 新增 `set_float_height` 命令，用于浮窗展开 / 收回时调整窗口高度。
+
+---
+
 ## [0.11.0] - 2026-06-10
 
 ### 新增

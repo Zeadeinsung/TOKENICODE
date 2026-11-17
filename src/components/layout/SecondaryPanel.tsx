@@ -1,6 +1,8 @@
 import { useSettingsStore, SecondaryPanelTab } from '../../stores/settingsStore';
 import { FileExplorer } from '../files/FileExplorer';
 import { SkillsPanel } from '../skills/SkillsPanel';
+import { PreviewPanel } from '../panel/PreviewPanel';
+import { McpPanel } from '../mcp/McpPanel';
 import { useT } from '../../lib/i18n';
 
 const tabs: { id: SecondaryPanelTab; labelKey: string; vb: string; d: string[] }[] = [
@@ -17,6 +19,16 @@ const tabs: { id: SecondaryPanelTab; labelKey: string; vb: string; d: string[] }
       'M766.848 266.24a118.592 118.592 0 0 1 85.76 48.96c46.144 79.936-55.424 231.68-226.24 338.368a32.768 32.768 0 0 0 34.752 55.616c207.296-129.344 314.112-312.832 248.256-426.816a177.728 177.728 0 0 0-131.776-80.896 32.832 32.832 0 0 0-10.752 64.768z',
       'M927.36 638.592a32.832 32.832 0 1 0-64.96 9.152 92.8 92.8 0 0 1-9.472 60.992c-43.712 75.52-227.264 76.8-431.104-40.512S127.424 390.656 171.2 315.136a89.6 89.6 0 0 1 41.472-35.904 32.768 32.768 0 0 0-27.712-59.456 153.6 153.6 0 0 0-70.4 62.528c-68.992 119.488 51.584 313.6 274.624 442.624a691.2 691.2 0 0 0 331.52 101.568 205.504 205.504 0 0 0 189.12-84.992 157.056 157.056 0 0 0 17.536-102.912z',
       'M512 512m-65.6 0a65.6 65.6 0 1 0 131.2 0 65.6 65.6 0 1 0-131.2 0Z',
+    ],
+  },
+  {
+    id: 'preview', labelKey: 'panel.preview', vb: '0 0 24 24', d: [
+      'M12 4.5C7 4.5 2.73 7.61 1 12c1.73 4.39 6 7.5 11 7.5s9.27-3.11 11-7.5c-1.73-4.39-6-7.5-11-7.5zM12 17a5 5 0 1 1 0-10 5 5 0 0 1 0 10zm0-3a2 2 0 1 0 0-4 2 2 0 0 0 0 4z',
+    ],
+  },
+  {
+    id: 'plugins', labelKey: 'panel.plugins', vb: '0 0 24 24', d: [
+      'M20.5 11H19V7a2 2 0 0 0-2-2h-4V3.5a2.5 2.5 0 0 0-5 0V5H4a2 2 0 0 0-2 2v3.8h1.5a2.5 2.5 0 0 1 0 5H2V20a2 2 0 0 0 2 2h3.8v-1.5a2.5 2.5 0 0 1 5 0V22H17a2 2 0 0 0 2-2v-4h1.5a2.5 2.5 0 0 0 0-5z',
     ],
   },
 ];
@@ -69,6 +81,8 @@ export function SecondaryPanel() {
       <div className="flex-1 overflow-hidden">
         {activeTab === 'files' && <FileExplorer />}
         {activeTab === 'skills' && <SkillsPanel />}
+        {activeTab === 'preview' && <PreviewPanel />}
+        {activeTab === 'plugins' && <McpPanel />}
       </div>
     </div>
   );

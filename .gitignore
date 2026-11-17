@@ -24,7 +24,15 @@ dist-ssr
 *.sw?
 
 # Rust build artifacts
-src-tauri/target/
+src-tauri/target*/
+tokenicode-new-*/
+
+# Android build outputs
+remote-mobile/android/app/build/
+remote-mobile/android/build/
+remote-mobile/android/.gradle/
+remote-mobile/android/local.properties
+remote-mobile/android/.claude/
 
 # Installer files
 *.dmg
@@ -76,3 +84,9 @@ screenshots/slash-commands.png
 
 # Test run outputs
 .test/runs/
+
+# Local-only build & debug scripts (hardcoded machine paths)
+build-tauri.cmd
+rebuild-restart.ps1
+build-log.txt
+*.bak-*

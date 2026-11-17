@@ -2,9 +2,10 @@ import { memo, useState, useCallback, type ReactNode } from 'react';
 import { type ChatMessage } from '../../stores/chatStore';
 import { useFileStore } from '../../stores/fileStore';
 import { useSettingsStore } from '../../stores/settingsStore';
-import { classifyPathToken, resolvePathToken } from '../../stores/fileReveal';
+import { classifyPathToken, resolvePathToken, splitPathAndLine } from '../../stores/fileReveal';
 import { useLightboxStore } from '../shared/ImageLightbox';
 import { useT } from '../../lib/i18n';
+import { explainShellCommand, shortPath } from '../../lib/activity-text';
 import { MarkdownRenderer } from '../shared/MarkdownRenderer';
 import { CommandProcessingCard } from './CommandProcessingCard';
 import { PlanReviewCard } from './PlanReviewCard';
@@ -61,18 +62,25 @@ function getFileExt(name: string): string {
 
 /** Render a single backtick-inner segment: file path → clickable chip, else → inline code */
 function renderCodeSegment(inner: string, key: number): ReactNode {
-  const kind = classifyPathToken(inner);
+  // 支持 `路径:123` / `路径:12-34`：摘掉行号后再判断是不是路径
+  const { path: pathText, line } = splitPathAndLine(inner);
+  const kind = classifyPathToken(pathText);
   if (kind) {
     const wd = useSettingsStore.getState().workingDirectory || '';
-    const resolved = resolvePathToken(inner, wd);
+    const resolved = resolvePathToken(pathText, wd);
     return (
       <button
         key={key}
         onClick={(e) => {
           e.stopPropagation();
-          // 纯定位：右侧文件区展开到该路径并高亮（不读内容、不预览）
           useSettingsStore.getState().setSecondaryTab('files');
-          useFileStore.getState().revealPath(resolved);
+          if (kind === 'folder') {
+            // 文件夹只展开定位
+            useFileStore.getState().revealPath(resolved);
+            return;
+          }
+          // 文件：只在右侧文件树里展开定位高亮，预览等用户点右侧栏那一行
+          useFileStore.getState().revealOrOpen(resolved, line);
         }}
         className="inline-flex items-center gap-1 px-2 py-0.5 mx-0.5
           bg-white/15 border border-white/40 rounded-full
@@ -459,12 +467,6 @@ function computeWriteLines(input: any): number | null {
   return input.content.split('\n').length;
 }
 
-/** Get short filename from path */
-function shortPath(filePath: string): string {
-  const parts = filePath.split(/[\\/]/);
-  return parts.length > 2 ? parts.slice(-2).join('/') : parts[parts.length - 1] || filePath;
-}
-
 /** Tool icon mini SVG */
 function ToolIcon({ name }: { name: string }) {
   switch (name) {
@@ -548,6 +550,7 @@ function getToolLabel(name: string, t: (key: string) => string): string {
     case 'Glob': case 'Grep': return t('msg.search');
     case 'Task': case 'Agent': return t('msg.subAgent');
     case 'TodoWrite': return t('msg.todo');
+    case 'TaskCreate': case 'TaskUpdate': case 'TaskList': case 'TaskGet': return t('msg.todo');
     case 'WebFetch': case 'WebSearch': return t('msg.webFetch');
     case 'ExitPlanMode': case 'EnterPlanMode': return t('msg.planLabel');
     default: return name;
@@ -556,7 +559,8 @@ function getToolLabel(name: string, t: (key: string) => string): string {
 
 export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
   const t = useT();
-  const [expanded, setExpanded] = useState(false);
+  // Show input, diff, and result by default; the header still collapses it.
+  const [expanded, setExpanded] = useState(true);
   const toolName = message.toolName || 'Tool';
   const label = getToolLabel(toolName, t);
   const input = message.toolInput;
@@ -565,6 +569,17 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
   const editDiff = toolName === 'Edit' ? computeEditDiff(input) : null;
   // Compute line count for Write tool
   const writeLines = toolName === 'Write' ? computeWriteLines(input) : null;
+
+  // One-line Chinese purpose for shell commands, so the raw command line is
+  // not the only thing telling the user what happened. The model's own
+  // `description` is authoritative; only fall back to the local heuristic when
+  // it did not write one.
+  const isShellTool = toolName === 'Bash' || toolName === 'PowerShell' || toolName === 'Shell';
+  const shellCommand = isShellTool ? String(input?.command ?? input?.script ?? '') : '';
+  const shellDescription = isShellTool && typeof input?.description === 'string'
+    ? input.description.trim()
+    : '';
+  const shellIntent = !shellDescription && shellCommand ? explainShellCommand(shellCommand) : '';
 
   // Build preview content based on tool type
   const renderPreview = () => {
@@ -583,7 +598,13 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
           <button
             onClick={(e) => {
               e.stopPropagation();
-              useFileStore.getState().selectFile(input.file_path);
+              useSettingsStore.getState().setSecondaryTab('files');
+              // Read 工具带 offset（0-based），定位到读取的起始行
+              const line = toolName === 'Read' && typeof input.offset === 'number'
+                ? input.offset + 1
+                : null;
+              // 工具卡也属于正文：只定位，不抢占右侧预览
+              useFileStore.getState().revealOrOpen(input.file_path, line);
             }}
             className="text-[11px] text-accent/70 hover:text-accent font-mono
               truncate max-w-[280px] hover:underline cursor-pointer transition-smooth"
@@ -641,6 +662,19 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
       );
     }
 
+    if (toolName === 'TaskUpdate') {
+      const status = input?.status;
+      const label = status === 'completed' ? '已完成'
+        : status === 'in_progress' ? '进行中'
+        : status === 'deleted' ? '已删除'
+        : '待开始';
+      return (
+        <span className="text-[11px] text-text-tertiary truncate max-w-[300px]">
+          {input?.subject ? `${input.subject} · ` : ''}{label}
+        </span>
+      );
+    }
+
     if (toolName === 'SendMessage' && input?.recipient) {
       return (
         <span className="text-[11px] text-text-tertiary truncate max-w-[300px] italic">
@@ -674,54 +708,67 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
   const isCompleted = message.toolCompleted || hasResult;
 
   // Render the expanded detail section
-  /** Render a side-by-side diff view for Edit tool old_string → new_string */
+  /** Shared frame for tool output cards. */
+  const cardClass = 'rounded-xl border border-border-subtle bg-bg-tool overflow-hidden';
+
+  /** Side-by-side diff for Edit, matching the VSCode extension layout. */
   const renderEditDiff = () => {
     if (!input?.old_string && !input?.new_string) return null;
     const oldLines = (input.old_string || '').split('\n');
     const newLines = (input.new_string || '').split('\n');
 
+    const renderColumn = (lines: string[], kind: 'old' | 'new') => {
+      const isOld = kind === 'old';
+      return (
+        <div className="min-w-0">
+          {lines.map((line, i) => (
+            <div
+              key={`${kind}-${i}`}
+              className={`flex items-start text-[11px] font-mono leading-[1.45] ${
+                isOld
+                  ? 'bg-red-500/[0.07] dark:bg-red-500/10'
+                  : 'bg-emerald-500/[0.07] dark:bg-emerald-500/10'
+              }`}
+            >
+              <span
+                className={`flex-shrink-0 w-9 text-right pr-2 select-none border-r ${
+                  isOld
+                    ? 'text-red-400/50 border-red-500/10'
+                    : 'text-emerald-400/50 border-emerald-500/10'
+                }`}
+              >
+                {i + 1}
+              </span>
+              <span
+                className={`flex-shrink-0 w-5 text-center select-none ${
+                  isOld ? 'text-red-400' : 'text-emerald-400'
+                }`}
+              >
+                {isOld ? '−' : '+'}
+              </span>
+              <span
+                className={`flex-1 px-1.5 whitespace-pre-wrap break-all ${
+                  isOld
+                    ? 'text-red-600 dark:text-red-400'
+                    : 'text-emerald-700 dark:text-emerald-400'
+                }`}
+              >
+                {line || ' '}
+              </span>
+            </div>
+          ))}
+        </div>
+      );
+    };
+
     return (
-      <div key="diff" className="rounded-lg border border-border-subtle overflow-hidden
-        max-h-48 overflow-y-auto">
-        {/* Removed lines */}
-        {oldLines.length > 0 && oldLines[0] !== '' && (
-          <div>
-            {oldLines.map((line: string, i: number) => (
-              <div key={`old-${i}`}
-                className="flex items-start gap-0 text-[11px] font-mono leading-relaxed
-                  bg-red-500/8 dark:bg-red-500/10">
-                <span className="flex-shrink-0 w-8 text-right pr-2 text-red-400/60
-                  select-none border-r border-red-500/10">
-                  {i + 1}
-                </span>
-                <span className="flex-shrink-0 w-5 text-center text-red-400 select-none">−</span>
-                <span className="text-red-600 dark:text-red-400 whitespace-pre-wrap break-all
-                  flex-1 px-1">{line}</span>
-              </div>
-            ))}
-          </div>
-        )}
-        {/* Added lines */}
-        {newLines.length > 0 && newLines[0] !== '' && (
-          <div>
-            {newLines.map((line: string, i: number) => (
-              <div key={`new-${i}`}
-                className="flex items-start gap-0 text-[11px] font-mono leading-relaxed
-                  bg-blue-500/8 dark:bg-blue-500/10">
-                <span className="flex-shrink-0 w-8 text-right pr-2 text-blue-400/60
-                  select-none border-r border-blue-500/10">
-                  {i + 1}
-                </span>
-                <span className="flex-shrink-0 w-5 text-center text-blue-400 select-none">+</span>
-                <span className="text-blue-600 dark:text-blue-400 whitespace-pre-wrap break-all
-                  flex-1 px-1">{line}</span>
-              </div>
-            ))}
-          </div>
-        )}
-        {/* File path */}
+      <div key="diff" className={`${cardClass} tool-scroll max-h-72 overflow-auto`}>
+        <div className="grid grid-cols-2 divide-x divide-border-subtle/70">
+          {renderColumn(oldLines, 'old')}
+          {renderColumn(newLines, 'new')}
+        </div>
         {input.file_path && (
-          <div className="px-2 py-1 border-t border-border-subtle/50
+          <div className="px-3 py-1.5 border-t border-border-subtle/60
             text-[10px] text-text-tertiary font-mono truncate">
             {input.file_path}
           </div>
@@ -730,38 +777,37 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
     );
   };
 
-  /** Render a Write tool diff — all lines shown as additions (blue) */
+  /** Write tool card: every line is an addition. */
   const renderWriteDiff = () => {
     if (!input?.content) return null;
     const allLines = input.content.split('\n');
-    const maxDisplay = 20;
+    const maxDisplay = 40;
     const displayLines = allLines.slice(0, maxDisplay);
     const remaining = allLines.length - maxDisplay;
 
     return (
-      <div key="write-diff" className="rounded-lg border border-border-subtle overflow-hidden
-        max-h-48 overflow-y-auto">
+      <div key="write-diff" className={`${cardClass} tool-scroll max-h-72 overflow-auto`}>
         {displayLines.map((line: string, i: number) => (
           <div key={i}
-            className="flex items-start gap-0 text-[11px] font-mono leading-relaxed
-              bg-blue-500/8 dark:bg-blue-500/10">
-            <span className="flex-shrink-0 w-8 text-right pr-2 text-blue-400/60
-              select-none border-r border-blue-500/10">
+            className="flex items-start text-[11px] font-mono leading-[1.45]
+              bg-emerald-500/[0.07] dark:bg-emerald-500/10">
+            <span className="flex-shrink-0 w-9 text-right pr-2 text-emerald-400/50
+              select-none border-r border-emerald-500/10">
               {i + 1}
             </span>
-            <span className="flex-shrink-0 w-5 text-center text-blue-400 select-none">+</span>
-            <span className="text-blue-600 dark:text-blue-400 whitespace-pre-wrap break-all
-              flex-1 px-1">{line}</span>
+            <span className="flex-shrink-0 w-5 text-center text-emerald-400 select-none">+</span>
+            <span className="text-emerald-700 dark:text-emerald-400 whitespace-pre-wrap break-all
+              flex-1 px-1.5">{line || ' '}</span>
           </div>
         ))}
         {remaining > 0 && (
-          <div className="px-2 py-1 text-[10px] text-text-tertiary font-mono
-            bg-blue-500/5 border-t border-blue-500/10">
+          <div className="px-3 py-1.5 text-[10px] text-text-tertiary font-mono
+            bg-emerald-500/5 border-t border-emerald-500/10">
             ... +{remaining} more lines
           </div>
         )}
         {input.file_path && (
-          <div className="px-2 py-1 border-t border-border-subtle/50
+          <div className="px-3 py-1.5 border-t border-border-subtle/60
             text-[10px] text-text-tertiary font-mono truncate">
             {input.file_path}
           </div>
@@ -770,55 +816,49 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
     );
   };
 
-  const renderExpandedContent = () => {
-    const sections: React.ReactNode[] = [];
-
-    // Show tool input (if meaningful)
-    if (hasInput) {
-      if (toolName === 'Bash' && input?.command) {
-        sections.push(
-          <div key="cmd" className="flex items-start gap-1.5">
-            <span className="text-text-tertiary/60 text-[11px] font-mono select-none">$</span>
-            <pre className="text-[11px] text-text-muted font-mono whitespace-pre-wrap break-all">
-              {input.command}
-            </pre>
-          </div>
-        );
-      } else if (toolName === 'Edit' && (input?.old_string || input?.new_string)) {
-        const diffView = renderEditDiff();
-        if (diffView) sections.push(diffView);
-      } else if (toolName === 'Write' && input?.content) {
-        const writeDiffView = renderWriteDiff();
-        if (writeDiffView) sections.push(writeDiffView);
-      } else {
-        sections.push(
-          <pre key="input" className="text-[11px] text-text-tertiary
-            overflow-x-auto font-mono leading-relaxed
-            max-h-32 overflow-y-auto whitespace-pre-wrap">
-            {typeof input === 'string' ? input : JSON.stringify(input, null, 2)}
+  /** IN / OUT block shared by terminal tools and the generic fallback. */
+  const renderIOBlock = (inText: string, outText: string) => (
+    <div className={cardClass}>
+      {inText && (
+        <div className="flex items-start gap-3 px-3 py-2 border-b border-border-subtle/60">
+          <span className="flex-shrink-0 pt-0.5 text-[9px] font-mono uppercase tracking-[0.12em] text-text-tertiary/70">
+            IN
+          </span>
+          <pre className="flex-1 min-w-0 text-[11.5px] font-mono leading-[1.5] text-text-primary
+            whitespace-pre-wrap break-all max-h-64 overflow-auto tool-scroll">
+            {inText}
           </pre>
-        );
-      }
-    }
+        </div>
+      )}
+      {outText && (
+        <div className="flex items-start gap-3 px-3 py-2">
+          <span className="flex-shrink-0 pt-0.5 text-[9px] font-mono uppercase tracking-[0.12em] text-success/80">
+            OUT
+          </span>
+          <pre className="flex-1 min-w-0 text-[11.5px] font-mono leading-[1.5] text-text-secondary
+            whitespace-pre-wrap break-all max-h-64 overflow-auto tool-scroll">
+            {outText}
+          </pre>
+        </div>
+      )}
+    </div>
+  );
 
-    // Show result content
-    if (hasResult) {
-      if (hasInput) {
-        // Divider between input and result
-        sections.push(
-          <div key="divider" className="border-t border-border-subtle/50 my-1" />
-        );
-      }
-      sections.push(
-        <pre key="result" className="text-[11px] text-text-tertiary
-          overflow-x-auto font-mono leading-relaxed
-          max-h-48 overflow-y-auto whitespace-pre-wrap">
-          {resultContent}
-        </pre>
-      );
+  const renderExpandedContent = () => {
+    if (toolName === 'Edit' && (input?.old_string || input?.new_string)) {
+      return renderEditDiff();
     }
-
-    return sections.length > 0 ? sections : null;
+    if (toolName === 'Write' && input?.content) {
+      return renderWriteDiff();
+    }
+    if (isShellTool) {
+      return renderIOBlock(shellCommand, resultContent);
+    }
+    if (!hasInput && !hasResult) return null;
+    const inText = hasInput
+      ? (typeof input === 'string' ? input : JSON.stringify(input, null, 2))
+      : '';
+    return renderIOBlock(inText, resultContent);
   };
 
   // Determine if expand makes sense
@@ -829,7 +869,7 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
     <div className={depth > 0 ? 'ml-16 mr-11 pl-3 border-l-2 border-accent/15' : 'ml-11 mr-11'}>
       <button
         onClick={() => canExpand && setExpanded(!expanded)}
-        className={`flex items-center gap-1.5 py-1 text-left group
+        className={`flex items-center gap-1.5 py-1.5 text-left group
           ${canExpand ? 'cursor-pointer' : 'cursor-default'}`}
       >
         {canExpand ? (
@@ -843,8 +883,16 @@ export const ToolUseMsg = memo(function ToolUseMsg({ message }: Props) {
           <span className="w-[10px] flex-shrink-0" />
         )}
         <ToolIcon name={toolName} />
-        <span className="text-xs font-medium text-text-muted">{label}</span>
-        {renderPreview()}
+        <span className="text-[12px] font-semibold text-text-primary">{label}</span>
+        {(shellDescription || shellIntent) && (
+          <span
+            className="text-[11.5px] text-text-tertiary truncate max-w-[320px] flex-shrink"
+            title={shellDescription || shellIntent}
+          >
+            {shellDescription || shellIntent}
+          </span>
+        )}
+        {!expanded && renderPreview()}
         {/* In-progress indicator: typing dots — result text is optional, completion is explicit. */}
         {!isCompleted && (
           <span
@@ -915,7 +963,7 @@ function ToolResultMsg({ message }: Props) {
       </button>
       {expanded && content && (
         <pre className="ml-5 mt-0.5 text-[11px] text-text-tertiary
-          overflow-x-auto font-mono leading-relaxed
+          overflow-x-auto font-mono leading-relaxed tool-scroll
           max-h-48 overflow-y-auto whitespace-pre-wrap">
           {content}
         </pre>
@@ -932,17 +980,18 @@ function ThinkingMsg({ message }: Props) {
   return (
     <div className="ml-11 mr-11">
       <details className="group">
-        <summary className="flex items-center gap-1.5 py-1
-          cursor-pointer text-[11px] text-text-tertiary list-none select-none">
+        <summary className="flex items-center gap-1.5 py-1.5
+          cursor-pointer text-[11.5px] text-text-tertiary list-none select-none">
           <svg width="10" height="10" viewBox="0 0 10 10" fill="none"
             stroke="currentColor" strokeWidth="1.5"
             className="transition-transform duration-150 group-open:rotate-90">
             <path d="M3 2l4 3-4 3" />
           </svg>
+          <span className="w-1.5 h-1.5 rounded-full bg-text-tertiary/50 flex-shrink-0" />
           {t('msg.thinking')}
         </summary>
         <pre className="ml-5 mt-0.5 text-[11px] text-text-tertiary
-          whitespace-pre-wrap max-h-48 overflow-y-auto
+          whitespace-pre-wrap max-h-48 overflow-y-auto tool-scroll
           font-mono leading-relaxed">
           {safeContent(message.content)}
         </pre>

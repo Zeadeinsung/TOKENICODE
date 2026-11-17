@@ -59,6 +59,16 @@ export interface ContentSearchResult {
   match_role: 'user' | 'assistant';
 }
 
+/** One matching message, as opposed to one matching session. `uuid` is the CLI's
+ *  own message id, which the chat view also uses as the rendered message key. */
+export interface MessageHit {
+  session_id: string;
+  uuid: string;
+  role: 'user' | 'assistant';
+  snippet: string;
+  timestamp: string | null;
+}
+
 export interface FileNode {
   name: string;
   path: string;
@@ -82,7 +92,7 @@ export interface FileChangeEvent {
 export interface SlashCommand {
   name: string;
   description: string;
-  source: 'builtin' | 'global' | 'project';
+  source: 'builtin' | 'global' | 'project' | 'plugin';
   has_args: boolean;
 }
 
@@ -90,7 +100,7 @@ export interface SkillInfo {
   name: string;
   description: string;
   path: string;
-  scope: 'global' | 'project';
+  scope: 'global' | 'project' | 'plugin';
   disable_model_invocation?: boolean;
   user_invocable?: boolean;
   allowed_tools?: string[];
@@ -186,7 +196,7 @@ export interface ProvidersFile {
 export interface UnifiedCommand {
   name: string;
   description: string;
-  source: 'builtin' | 'global' | 'project';
+  source: 'builtin' | 'global' | 'project' | 'plugin';
   category: 'builtin' | 'command' | 'skill';
   has_args: boolean;
   path?: string;
@@ -232,6 +242,9 @@ export const bridge = {
   searchSessions: (query: string) =>
     invoke<ContentSearchResult[]>('search_sessions', { query }),
 
+  searchMessages: (query: string, limit?: number) =>
+    invoke<MessageHit[]>('search_messages', { query, limit }),
+
   loadSession: (path: string) =>
     invoke<any[]>('load_session', { path }),
 
@@ -243,6 +256,10 @@ export const bridge = {
 
   openWithDefaultApp: (path: string) =>
     invoke<void>('open_with_default_app', { path }),
+
+  /** 只读预览任意路径（工作区外的文件也能看），用于聊天里点路径定位。 */
+  readFileForReveal: (path: string) =>
+    invoke<string>('read_file_for_reveal', { path }),
 
   shareFile: (path: string) =>
     invoke<void>('share_file', { path }),
@@ -365,6 +382,10 @@ export const bridge = {
   // Setup: CLI detection, installation & login
   checkClaudeCli: () =>
     invoke<CliStatus>('check_claude_cli'),
+
+  /** env block of ~/.claude/settings.json (e.g. CLAUDE_CODE_MAX_CONTEXT_TOKENS) */
+  readClaudeEnv: () =>
+    invoke<Record<string, string>>('read_claude_env'),
 
   /** Scan all CLI installations with version/issues for diagnostic UI */
   diagnoseCli: () =>

@@ -1,5 +1,5 @@
 import { useState, useCallback, useEffect } from 'react';
-import { type ChatMessage, useChatStore } from '../../stores/chatStore';
+import { type ChatMessage, type UserQuestion, useChatStore } from '../../stores/chatStore';
 import { bridge } from '../../lib/tauri-bridge';
 import { useT } from '../../lib/i18n';
 
@@ -8,6 +8,37 @@ function decodeUnicodeEscapes(text: string): string {
   return text.replace(/\\u([0-9A-Fa-f]{4})/g, (_, hex) =>
     String.fromCharCode(parseInt(hex, 16)),
   );
+}
+
+/**
+ * Build the AskUserQuestion tool-result `answers` map.
+ *
+ * Per the Claude Code SDK, each key MUST be the question's full text
+ * (`question` field) and the value the selected option label(s) joined
+ * with ", " (or free text for the "Other" option). Keying by index or id
+ * makes the model report that it received no answer.
+ */
+export function buildAnswersObject(
+  questions: UserQuestion[],
+  selectedMap: Record<number, Set<number>>,
+  useOther: Record<number, boolean>,
+  otherText: Record<number, string>,
+): Record<string, string> {
+  const answers: Record<string, string> = {};
+  questions.forEach((q, qIdx) => {
+    if (useOther[qIdx] && otherText[qIdx]?.trim()) {
+      answers[q.question] = otherText[qIdx].trim();
+    } else {
+      const selected = selectedMap[qIdx] || new Set<number>();
+      const labels = Array.from(selected)
+        .map((i) => q.options[i]?.label)
+        .filter(Boolean);
+      if (labels.length > 0) {
+        answers[q.question] = labels.join(', ');
+      }
+    }
+  });
+  return answers;
 }
 
 interface Props {
@@ -131,20 +162,7 @@ export function QuestionCard({ message, floating }: Props) {
       const owner = resolveOwner();
       if (!owner) return;
       const { setInteractionState, setSessionStatus, setActivityStatus } = useChatStore.getState();
-      const answers: Record<string, string> = {};
-      questions.forEach((q, qIdx) => {
-        if (useOther[qIdx] && otherText[qIdx]?.trim()) {
-          answers[String(qIdx)] = otherText[qIdx].trim();
-        } else {
-          const selected = selectedMap[qIdx] || new Set<number>();
-          const labels = Array.from(selected)
-            .map((i) => q.options[i]?.label)
-            .filter(Boolean);
-          if (labels.length > 0) {
-            answers[String(qIdx)] = labels.join(', ');
-          }
-        }
-      });
+      const answers = buildAnswersObject(questions, selectedMap, useOther, otherText);
       setInteractionState(owner.tabId, message.id, 'sending');
       try {
         // SDK control path only — the legacy sendStdin fallback was removed

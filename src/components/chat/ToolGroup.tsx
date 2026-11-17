@@ -22,9 +22,9 @@ function buildToolSummary(messages: ChatMessage[]): string {
 /**
  * ToolGroup — collapsible wrapper for 3+ consecutive tool_use messages.
  *
+ * - Expanded by default: individual ToolUseMsg components with a left border
+ *   connector, so code diffs and command output stay visible without a click
  * - Collapsed: summary line "4 tool calls (Edit x2, Read, Bash)"
- * - Expanded: individual ToolUseMsg components with a left border connector
- * - Auto-collapses when all tools have results
  */
 export function ToolGroup({ messages }: Props) {
   const t = useT();
@@ -35,7 +35,7 @@ export function ToolGroup({ messages }: Props) {
     [messages],
   );
 
-  const [expanded, setExpanded] = useState(false);
+  const [expanded, setExpanded] = useState(true);
 
   const summary = useMemo(() => buildToolSummary(messages), [messages]);
   const count = messages.length;

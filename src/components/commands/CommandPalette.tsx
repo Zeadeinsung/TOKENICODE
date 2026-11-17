@@ -4,6 +4,7 @@ import { useChatStore } from '../../stores/chatStore';
 import { useSessionStore } from '../../stores/sessionStore';
 import { useAgentStore } from '../../stores/agentStore';
 import { useT } from '../../lib/i18n';
+import { useGlobalSearchStore } from '../search/GlobalSearchPanel';
 
 interface CommandItem {
   id: string;
@@ -41,6 +42,12 @@ export function CommandPalette() {
         useSessionStore.getState().setSelectedSession(null);
         useSettingsStore.getState().setWorkingDirectory('');
       },
+    },
+    {
+      id: 'search-chats', labelKey: 'cmd.searchChat',
+      descKey: 'cmd.searchChatDesc',
+      categoryKey: 'cmd.chat', icon: 'M7 3a4 4 0 100 8A4 4 0 007 3zM10.5 10.5L14 14',
+      action: () => useGlobalSearchStore.getState().setOpen(true),
     },
     {
       id: 'toggle-sidebar', labelKey: 'cmd.toggleSidebar',

@@ -108,6 +108,7 @@ export function ConversationList() {
   const isContentSearching = useSessionStore((s) => s.isContentSearching);
   const searchSessionContent = useSessionStore((s) => s.searchSessionContent);
   const clearContentSearch = useSessionStore((s) => s.clearContentSearch);
+  const pendingReveal = useSessionStore((s) => s.pendingReveal);
 
   // Context menus
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
@@ -371,7 +372,8 @@ export function ConversationList() {
       if (useSessionStore.getState().selectedSessionId !== sessionId) {
         return;
       }
-      const { messages, agents } = parseSessionMessages(rawMessages);
+      const { messages, agents, contextTokens } = parseSessionMessages(rawMessages);
+      if (contextTokens) setSessionMeta(sessionId, { contextTokens });
 
       // Apply agents
       for (const agent of agents) {
@@ -403,6 +405,16 @@ export function ConversationList() {
       });
     }
   }, [selectedId, setSelected, t]);
+
+  // Global search picked a message: open the session it belongs to. The hit can
+  // arrive before anything is loaded, so this also covers waiting for
+  // `sessions` to populate on a cold start.
+  useEffect(() => {
+    if (!pendingReveal) return;
+    if (pendingReveal.sessionId === selectedId) return;
+    const target = sessions.find((s) => s.id === pendingReveal.sessionId);
+    if (target) void handleLoadSession(target);
+  }, [pendingReveal, sessions, selectedId, handleLoadSession]);
 
   // --- Delete handlers ---
   const executeDelete = useCallback(async (sessionId: string, sessionPath: string) => {

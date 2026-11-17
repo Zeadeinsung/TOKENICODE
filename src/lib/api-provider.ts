@@ -141,8 +141,13 @@ export function is1MModel(modelId?: string): boolean {
 /**
  * Return the auto-compact token threshold for the given model.
  * 80% of context window: 160K for 200K models, 800K for 1M models.
+ * An explicit CLAUDE_CODE_MAX_CONTEXT_TOKENS wins, since that is the window the
+ * CLI itself uses for the spawned model — otherwise proxied ids such as
+ * `deepseek-flash` would compact at 160K while the CLI still has 1M available.
  */
 export function getAutoCompactThreshold(modelId?: string): number {
+  const configured = useSettingsStore.getState().claudeMaxContextTokens;
+  if (configured > 0) return Math.floor(configured * 0.8);
   return is1MModel(modelId) ? 800_000 : 160_000;
 }
 

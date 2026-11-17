@@ -3,7 +3,7 @@ import { useChatStore, useActiveTab, getActiveTabState, generateMessageId, isSes
 import { useSettingsStore, MODEL_OPTIONS, mapSessionModeToPermissionMode, setSessionModeLocal, type ThinkingLevel } from '../../stores/settingsStore';
 import { bridge, type UnifiedCommand } from '../../lib/tauri-bridge';
 import { ModelSelector } from './ModelSelector';
-// import { ModeSelector } from './ModeSelector';
+import { ModeSelector } from './ModeSelector';
 import { FileUploadChips } from './FileUploadChips';
 import { RewindPanel } from './RewindPanel';
 import { useFileAttachments } from '../../hooks/useFileAttachments';
@@ -1655,8 +1655,8 @@ export function InputBar() {
             onChange={handleFileSelect}
           />
 
-          {/* Mode selector — hidden, use /ask /plan /code /bypass slash commands */}
-          {/* <ModeSelector disabled={isRunning} /> */}
+          {/* Mode selector — 编码/询问/计划/全自动 */}
+          <ModeSelector disabled={isRunning} />
 
           {/* Think toggle */}
           <ThinkLevelSelector disabled={isRunning} />

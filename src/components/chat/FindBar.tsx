@@ -1,4 +1,5 @@
 import { useEffect, useRef } from 'react';
+import { useT } from '../../lib/i18n';
 
 interface FindBarProps {
   query: string;
@@ -8,9 +9,18 @@ interface FindBarProps {
   next: () => void;
   prev: () => void;
   close: () => void;
+  caseSensitive: boolean;
+  setCaseSensitive: (v: boolean) => void;
+  regex: boolean;
+  setRegex: (v: boolean) => void;
+  isInvalid: boolean;
 }
 
-export function FindBar({ query, setQuery, matchIndex, matchCount, next, prev, close }: FindBarProps) {
+export function FindBar({
+  query, setQuery, matchIndex, matchCount, next, prev, close,
+  caseSensitive, setCaseSensitive, regex, setRegex, isInvalid,
+}: FindBarProps) {
+  const t = useT();
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -21,7 +31,7 @@ export function FindBar({ query, setQuery, matchIndex, matchCount, next, prev, c
   return (
     <div className="absolute top-2 right-4 z-50 flex items-center gap-1.5 px-3 py-1.5 rounded-lg shadow-md
       bg-bg-card border border-border text-text-primary text-[13px]"
-      style={{ minWidth: 260 }}
+      style={{ minWidth: 300 }}
     >
       <input
         ref={inputRef}
@@ -38,12 +48,29 @@ export function FindBar({ query, setQuery, matchIndex, matchCount, next, prev, c
             close();
           }
         }}
-        placeholder="查找…"
-        className="flex-1 min-w-0 bg-transparent outline-none placeholder:text-text-muted"
+        placeholder={t('find.placeholder')}
+        className={`flex-1 min-w-0 bg-transparent outline-none placeholder:text-text-muted
+          ${isInvalid ? 'text-error' : ''}`}
       />
       <span className="text-text-tertiary text-[12px] whitespace-nowrap tabular-nums">
         {query ? `${matchCount > 0 ? matchIndex + 1 : 0}/${matchCount}` : ''}
       </span>
+      <button
+        onClick={() => setCaseSensitive(!caseSensitive)}
+        className={`px-1 py-0.5 rounded text-[11px] font-medium transition-colors
+          ${caseSensitive ? 'bg-accent/15 text-accent' : 'text-text-tertiary hover:bg-bg-secondary'}`}
+        title={t('find.caseSensitive')}
+      >
+        Aa
+      </button>
+      <button
+        onClick={() => setRegex(!regex)}
+        className={`px-1 py-0.5 rounded text-[11px] font-mono transition-colors
+          ${regex ? 'bg-accent/15 text-accent' : 'text-text-tertiary hover:bg-bg-secondary'}`}
+        title={t('find.regex')}
+      >
+        .*
+      </button>
       <button
         onClick={prev}
         disabled={matchCount === 0}
